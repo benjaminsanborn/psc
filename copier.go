@@ -18,6 +18,7 @@ type CopyState struct {
 	TargetService string `json:"target_service"`
 	TableName     string `json:"table_name"`
 	PrimaryKey    string `json:"primary_key"`
+	ChunkSize     int64  `json:"chunk_size"`
 	LastID        int64  `json:"last_id"`
 	StartTime     string `json:"start_time"`
 	LastUpdate    string `json:"last_update"`
@@ -35,22 +36,22 @@ type CopyProgress struct {
 }
 
 // CopyTableWithProgress copies a table with progress updates sent to a channel
-func CopyTableWithProgress(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, progressChan chan<- CopyProgress) error {
+func CopyTableWithProgress(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64, progressChan chan<- CopyProgress) error {
 	defer func() {
 		if r := recover(); r != nil {
 			progressChan <- CopyProgress{Error: fmt.Errorf("panic: %v", r)}
 		}
 	}()
 
-	return copyTableInternal(sourceName, targetName, source, target, tableName, primaryKey, lastID, progressChan)
+	return copyTableInternal(sourceName, targetName, source, target, tableName, primaryKey, lastID, chunkSize, progressChan)
 }
 
 // CopyTable copies a table from source to target database (non-interactive version)
-func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64) error {
-	return copyTableInternal(sourceName, targetName, source, target, tableName, primaryKey, lastID, nil)
+func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64) error {
+	return copyTableInternal(sourceName, targetName, source, target, tableName, primaryKey, lastID, chunkSize, nil)
 }
 
-func copyTableInternal(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, progressChan chan<- CopyProgress) error {
+func copyTableInternal(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64, progressChan chan<- CopyProgress) error {
 	sendProgress := func(msg string, totalRows, copiedRows, lastID int64, percentage float64) {
 		if progressChan != nil {
 			progressChan <- CopyProgress{
@@ -107,6 +108,7 @@ func copyTableInternal(sourceName, targetName string, source, target ServiceConf
 		TargetService: targetName,
 		TableName:     tableName,
 		PrimaryKey:    primaryKey,
+		ChunkSize:     chunkSize,
 		LastID:        lastID,
 		StartTime:     time.Now().Format(time.RFC3339),
 		LastUpdate:    time.Now().Format(time.RFC3339),
@@ -120,11 +122,11 @@ func copyTableInternal(sourceName, targetName string, source, target ServiceConf
 
 	// Copy data
 	sendProgress("Starting data copy...", 0, 0, 0, 0)
-	return copyData(sourceName, targetName, sourceDB, targetDB, tableName, primaryKey, lastID, stateFile, &state, progressChan)
+	return copyData(sourceName, targetName, sourceDB, targetDB, tableName, primaryKey, lastID, chunkSize, stateFile, &state, progressChan)
 }
 
 // copyData copies all rows from source to target using COPY commands in chunks
-func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string, startID int64, stateFile string, state *CopyState, progressChan chan<- CopyProgress) error {
+func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string, startID int64, chunkSize int64, stateFile string, state *CopyState, progressChan chan<- CopyProgress) error {
 	sendProgress := func(msg string, totalRows, copiedRows, lastID int64, percentage float64) {
 		if progressChan != nil {
 			progressChan <- CopyProgress{
@@ -180,7 +182,6 @@ func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableNa
 	sendProgress(fmt.Sprintf("Using column '%s' for chunking", idColumn), estimatedRows, 0, startID, 0)
 
 	// Copy data in chunks
-	chunkSize := int64(1000)
 	lastMaxID := startID
 	totalCopied := int64(0)
 

@@ -21,38 +21,41 @@ const (
 	screenTable
 	screenPrimaryKey
 	screenLastID
+	screenChunkSize
 	screenConfirm
 	screenCopying
 	screenDone
 )
 
 type model struct {
-	screen         screen
-	services       map[string]ServiceConfig
-	serviceNames   []string
-	source         string
-	target         string
-	table          string
-	tables         []string
-	primaryKey     string
-	lastID         string
-	cursor         int
-	viewportTop    int
-	viewportSize   int
-	err            error
-	result         string
-	configPath     string
-	resumeFiles    []string
-	resumeStates   []*CopyState
-	progressMsg    string
-	totalRows      int64
-	copiedRows     int64
-	currentLastID  int64
-	progressPct    float64
-	copyInProgress bool
-	progressChan   chan CopyProgress
-	filterText     string
-	filteredItems  []string
+	screen          screen
+	services        map[string]ServiceConfig
+	serviceNames    []string
+	source          string
+	target          string
+	table           string
+	tables          []string
+	primaryKey      string
+	lastID          string
+	chunkSize       string
+	chunkSizeEdited bool
+	cursor          int
+	viewportTop     int
+	viewportSize    int
+	err             error
+	result          string
+	configPath      string
+	resumeFiles     []string
+	resumeStates    []*CopyState
+	progressMsg     string
+	totalRows       int64
+	copiedRows      int64
+	currentLastID   int64
+	progressPct     float64
+	copyInProgress  bool
+	progressChan    chan CopyProgress
+	filterText      string
+	filteredItems   []string
 }
 
 var (
@@ -123,6 +126,7 @@ func runInteractive() error {
 		serviceNames: serviceNames,
 		primaryKey:   "id",
 		lastID:       "1",
+		chunkSize:    "1000",
 		configPath:   configPath,
 		viewportSize: 10, // Show 10 items at a time
 		resumeFiles:  resumeFiles,
@@ -204,6 +208,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.table = state.TableName
 					m.primaryKey = state.PrimaryKey
 					m.lastID = fmt.Sprintf("%d", state.LastID)
+					if state.ChunkSize > 0 {
+						m.chunkSize = fmt.Sprintf("%d", state.ChunkSize)
+					}
 					m.screen = screenConfirm
 					m.cursor = 0
 					m.viewportTop = 0
@@ -260,6 +267,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenLastID
 
 			case screenLastID:
+				m.screen = screenChunkSize
+
+			case screenChunkSize:
 				m.screen = screenConfirm
 
 			case screenConfirm:
@@ -295,8 +305,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenPrimaryKey
 				m.cursor = 0
 				m.viewportTop = 0
-			case screenConfirm:
+			case screenChunkSize:
 				m.screen = screenLastID
+				m.cursor = 0
+				m.viewportTop = 0
+				m.chunkSizeEdited = false
+			case screenConfirm:
+				m.screen = screenChunkSize
 				m.cursor = 0
 				m.viewportTop = 0
 			}
@@ -312,6 +327,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.lastID = m.lastID[:len(m.lastID)-1]
 					if len(m.lastID) == 0 {
 						m.lastID = "1" // Reset to default
+					}
+				}
+			} else if m.screen == screenChunkSize {
+				if len(m.chunkSize) > 0 {
+					m.chunkSize = m.chunkSize[:len(m.chunkSize)-1]
+					m.chunkSizeEdited = true
+					if len(m.chunkSize) == 0 {
+						m.chunkSize = "1000" // Reset to default
+						m.chunkSizeEdited = false
 					}
 				}
 			} else if m.screen == screenSource || m.screen == screenTarget || m.screen == screenTable {
@@ -343,6 +367,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.lastID = msg.String()
 					} else {
 						m.lastID += msg.String()
+					}
+				}
+			}
+			// Handle numeric input for chunk-size
+			if m.screen == screenChunkSize {
+				if len(msg.String()) == 1 && msg.String()[0] >= '0' && msg.String()[0] <= '9' {
+					// Only allow digits
+					if !m.chunkSizeEdited && m.chunkSize == "1000" {
+						// Replace default "1000" with first digit
+						m.chunkSize = msg.String()
+						m.chunkSizeEdited = true
+					} else {
+						m.chunkSize += msg.String()
+						m.chunkSizeEdited = true
 					}
 				}
 			}
@@ -450,8 +488,12 @@ func (m model) View() string {
 			} else {
 				// Existing copy operation
 				state := m.resumeStates[i]
-				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d)",
-					state.SourceService, state.TargetService, state.TableName, state.LastID)
+				chunkInfo := ""
+				if state.ChunkSize > 0 {
+					chunkInfo = fmt.Sprintf(", chunk: %d", state.ChunkSize)
+				}
+				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s)",
+					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo)
 				if i == m.cursor {
 					s.WriteString(selectedStyle.Render("▸ " + label))
 				} else {
@@ -645,6 +687,21 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue (1 = start from beginning)"))
 
+	case screenChunkSize:
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
+		s.WriteString("\n\n")
+		s.WriteString(promptStyle.Render("Enter chunk size (rows per batch):"))
+		s.WriteString("\n\n")
+		s.WriteString(selectedStyle.Render(m.chunkSize))
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render("Press Enter to continue (default: 1000)"))
+
 	case screenConfirm:
 		s.WriteString(titleStyle.Render("Confirm Copy Operation"))
 		s.WriteString("\n\n")
@@ -657,6 +714,8 @@ func (m model) View() string {
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Chunk Size:  %s rows", m.chunkSize)))
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Press Enter to start copy, \\ to go back"))
 
@@ -734,9 +793,17 @@ func (m model) performCopy() tea.Cmd {
 		}
 	}
 
+	// Parse chunkSize
+	var chunkSize int64 = 1000
+	if m.chunkSize != "" {
+		if parsed, err := strconv.ParseInt(m.chunkSize, 10, 64); err == nil {
+			chunkSize = parsed
+		}
+	}
+
 	// Start copy in goroutine
 	go func() {
-		err := CopyTableWithProgress(m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, m.progressChan)
+		err := CopyTableWithProgress(m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, chunkSize, m.progressChan)
 		if err != nil {
 			m.progressChan <- CopyProgress{Error: err}
 		}
