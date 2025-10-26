@@ -8,6 +8,14 @@ import (
 )
 
 func main() {
+	// Check if running without arguments - launch interactive mode
+	if len(os.Args) == 1 {
+		if err := runInteractive(); err != nil {
+			log.Fatalf("Interactive mode failed: %v", err)
+		}
+		return
+	}
+
 	source := flag.String("source", "", "Source service name from pg_service.conf")
 	target := flag.String("target", "", "Target service name from pg_service.conf")
 	table := flag.String("table", "", "Table name to copy")
