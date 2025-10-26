@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 )
 
 // CopyTable copies a table from source to target database
-func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string) error {
+func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64) error {
 	// Connect to source
 	sourceDB, err := sql.Open("postgres", source.ConnectionString())
 	if err != nil {
@@ -45,11 +46,11 @@ func CopyTable(sourceName, targetName string, source, target ServiceConfig, tabl
 
 	// Copy data
 	fmt.Printf("Copying data...\n")
-	return copyData(sourceName, targetName, sourceDB, targetDB, tableName, primaryKey)
+	return copyData(sourceName, targetName, sourceDB, targetDB, tableName, primaryKey, lastID)
 }
 
 // copyData copies all rows from source to target using COPY commands in chunks
-func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string) error {
+func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string, startID int64) error {
 	// Get estimated row count
 	var estimatedRows int64
 	countSQL := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE relname = '%s'", tableName)
@@ -92,12 +93,15 @@ func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableNa
 	fmt.Printf("Using column '%s' for chunking\n", idColumn)
 
 	// Copy data in chunks
-	chunkSize := 1000
-	lastMaxID := interface{}(nil)
-	totalCopied := 0
+	chunkSize := int64(1000)
+	lastMaxID := startID
+	totalCopied := int64(0)
 
 	for {
+		startTime := time.Now()
 		copied, newMaxID, err := copyChunk(sourceName, targetName, sourceDB, tableName, idColumn, lastMaxID, chunkSize)
+		elapsed := time.Since(startTime)
+
 		if err != nil {
 			return fmt.Errorf("failed to copy chunk (lastMaxID=%v): %w", lastMaxID, err)
 		}
@@ -110,8 +114,8 @@ func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableNa
 		lastMaxID = newMaxID
 		totalCopied += copied
 
-		fmt.Printf("Progress: %d/%d rows (%.1f%%)\n", totalCopied, estimatedRows,
-			float64(totalCopied)/float64(estimatedRows)*100)
+		fmt.Printf("Progress: %d/%d rows (%.1f%%) - chunk took %v\n", totalCopied, estimatedRows,
+			float64(totalCopied)/float64(estimatedRows)*100, elapsed)
 
 		if copied < chunkSize {
 			break
@@ -124,46 +128,18 @@ func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableNa
 
 // copyChunk copies a single chunk of data using psql COPY with binary format
 func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string,
-	idColumn string, lastMaxID interface{}, chunkSize int) (int, interface{}, error) {
+	idColumn string, lastMaxID int64, chunkSize int64) (int64, int64, error) {
 
-	// Determine the ID range for this chunk
-	var startID, endID interface{}
-	var rowCount int
-
-	if lastMaxID == nil {
-		// First chunk - get the first chunkSize IDs
-		query := fmt.Sprintf("SELECT MIN(%s), MAX(%s), COUNT(*) FROM (SELECT %s FROM %s ORDER BY %s LIMIT %d) t",
-			idColumn, idColumn, idColumn, tableName, idColumn, chunkSize)
-		fmt.Printf("SQL: %s\n", query)
-		err := sourceDB.QueryRow(query).Scan(&startID, &endID, &rowCount)
-		if err == sql.ErrNoRows || rowCount == 0 {
-			return 0, nil, nil
-		}
-		if err != nil {
-			return 0, nil, fmt.Errorf("failed to get first chunk range: %w", err)
-		}
-	} else {
-		// Subsequent chunks - get next chunkSize IDs after lastMaxID
-		query := fmt.Sprintf("SELECT MIN(%s), MAX(%s), COUNT(*) FROM (SELECT %s FROM %s WHERE %s > $1 ORDER BY %s LIMIT %d) t",
-			idColumn, idColumn, idColumn, tableName, idColumn, idColumn, chunkSize)
-		fmt.Printf("SQL: %s\n", query)
-		err := sourceDB.QueryRow(query, lastMaxID).Scan(&startID, &endID, &rowCount)
-		if err == sql.ErrNoRows || rowCount == 0 {
-			return 0, nil, nil
-		}
-		if err != nil {
-			return 0, nil, fmt.Errorf("failed to get chunk range: %w", err)
-		}
+	// Get the minimum ID for this chunk
+	var minID int64 = 1
+	if lastMaxID != 0 {
+		minID = lastMaxID
 	}
-
-	if rowCount == 0 {
-		return 0, nil, nil
-	}
+	var maxID = minID + chunkSize
 
 	// Build the COPY command
-	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s BETWEEN %v AND %v) TO STDOUT (FORMAT binary)",
-		tableName, idColumn, startID, endID)
-	fmt.Printf("SQL: %s\n", copySQL)
+	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d  ) TO STDOUT (FORMAT binary)",
+		tableName, idColumn, minID, idColumn, maxID)
 
 	// Build psql commands
 	sourceCmd := exec.Command("psql", fmt.Sprintf("service=%s", sourceName), "-Atc", copySQL)
@@ -173,7 +149,7 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 	// Pipe source to target
 	pipe, err := sourceCmd.StdoutPipe()
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to create pipe: %w", err)
+		return 0, 0, fmt.Errorf("failed to create pipe: %w", err)
 	}
 	targetCmd.Stdin = pipe
 
@@ -187,19 +163,19 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 
 	// Start target first
 	if err := targetCmd.Start(); err != nil {
-		return 0, nil, fmt.Errorf("failed to start target psql: %w", err)
+		return 0, 0, fmt.Errorf("failed to start target psql: %w", err)
 	}
 
 	// Start source
 	if err := sourceCmd.Start(); err != nil {
 		targetCmd.Process.Kill()
-		return 0, nil, fmt.Errorf("failed to start source psql: %w", err)
+		return 0, 0, fmt.Errorf("failed to start source psql: %w", err)
 	}
 
 	// Wait for source to finish
 	if err := sourceCmd.Wait(); err != nil {
 		targetCmd.Process.Kill()
-		return 0, nil, fmt.Errorf("source psql failed: %w, stderr: %s", err, sourceCmdErr.String())
+		return 0, 0, fmt.Errorf("source psql failed: %w, stderr: %s", err, sourceCmdErr.String())
 	}
 
 	// Close the pipe
@@ -207,7 +183,7 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 
 	// Wait for target to finish
 	if err := targetCmd.Wait(); err != nil {
-		return 0, nil, fmt.Errorf("target psql failed: %w, stderr: %s", err, targetCmdErr.String())
+		return 0, 0, fmt.Errorf("target psql failed: %w, stderr: %s", err, targetCmdErr.String())
 	}
 
 	// Print output from commands
@@ -224,5 +200,5 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 	fmt.Printf("Shell: psql service=%s -Atc \"%s\" | psql service=%s -c \"COPY %s FROM STDIN (FORMAT binary)\"\n",
 		sourceName, copySQL, targetName, tableName)
 
-	return rowCount, endID, nil
+	return chunkSize, maxID, nil
 }

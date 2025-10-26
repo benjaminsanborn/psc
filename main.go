@@ -12,6 +12,7 @@ func main() {
 	target := flag.String("target", "", "Target service name from pg_service.conf")
 	table := flag.String("table", "", "Table name to copy")
 	primaryKey := flag.String("primary-key", "id", "Primary key column for chunking (defaults to 'id')")
+	lastID := flag.Int64("last-id", 0, "Resume copy from this ID (optional, defaults to 0)")
 
 	flag.Parse()
 
@@ -45,8 +46,12 @@ func main() {
 	}
 
 	// Copy table
-	fmt.Printf("Copying table '%s' from '%s' to '%s'...\n", *table, *source, *target)
-	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *primaryKey); err != nil {
+	if *lastID > 0 {
+		fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d...\n", *table, *source, *target, *lastID)
+	} else {
+		fmt.Printf("Copying table '%s' from '%s' to '%s'...\n", *table, *source, *target)
+	}
+	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *primaryKey, *lastID); err != nil {
 		log.Fatalf("Failed to copy table: %v", err)
 	}
 
