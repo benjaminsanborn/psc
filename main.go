@@ -8,6 +8,14 @@ import (
 )
 
 func main() {
+	// Check for existing copy state files and display them
+	stateFiles, err := FindAllCopyStateFiles()
+	if err != nil {
+		log.Printf("Warning: failed to check for existing copy files: %v", err)
+	} else {
+		DisplayCopyStateFiles(stateFiles)
+	}
+
 	// Check if running without arguments - launch interactive mode
 	if len(os.Args) == 1 {
 		if err := runInteractive(); err != nil {

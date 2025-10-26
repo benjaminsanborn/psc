@@ -15,7 +15,8 @@ import (
 type screen int
 
 const (
-	screenSource screen = iota
+	screenResume screen = iota
+	screenSource
 	screenTarget
 	screenTable
 	screenPrimaryKey
@@ -26,21 +27,30 @@ const (
 )
 
 type model struct {
-	screen       screen
-	services     map[string]ServiceConfig
-	serviceNames []string
-	source       string
-	target       string
-	table        string
-	tables       []string
-	primaryKey   string
-	lastID       string
-	cursor       int
-	viewportTop  int
-	viewportSize int
-	err          error
-	result       string
-	configPath   string
+	screen         screen
+	services       map[string]ServiceConfig
+	serviceNames   []string
+	source         string
+	target         string
+	table          string
+	tables         []string
+	primaryKey     string
+	lastID         string
+	cursor         int
+	viewportTop    int
+	viewportSize   int
+	err            error
+	result         string
+	configPath     string
+	resumeFiles    []string
+	resumeStates   []*CopyState
+	progressMsg    string
+	totalRows      int64
+	copiedRows     int64
+	currentLastID  int64
+	progressPct    float64
+	copyInProgress bool
+	progressChan   chan CopyProgress
 }
 
 var (
@@ -90,14 +100,31 @@ func runInteractive() error {
 		return fmt.Errorf("no services found in %s", configPath)
 	}
 
+	// Check for existing copy state files
+	resumeFiles, _ := FindAllCopyStateFiles()
+	var resumeStates []*CopyState
+	for _, file := range resumeFiles {
+		if state, err := LoadCopyState(file); err == nil {
+			resumeStates = append(resumeStates, state)
+		}
+	}
+
+	// Start at resume screen if there are existing copies, otherwise source screen
+	startScreen := screenSource
+	if len(resumeFiles) > 0 {
+		startScreen = screenResume
+	}
+
 	m := model{
-		screen:       screenSource,
+		screen:       startScreen,
 		services:     services,
 		serviceNames: serviceNames,
 		primaryKey:   "id",
 		lastID:       "1",
 		configPath:   configPath,
 		viewportSize: 10, // Show 10 items at a time
+		resumeFiles:  resumeFiles,
+		resumeStates: resumeStates,
 	}
 
 	p := tea.NewProgram(m)
@@ -131,6 +158,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			var maxItems int
 			switch m.screen {
+			case screenResume:
+				maxItems = len(m.resumeFiles) + 1 // +1 for "Start new copy" option
 			case screenSource, screenTarget:
 				maxItems = len(m.serviceNames)
 			case screenTable:
@@ -149,6 +178,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			switch m.screen {
+			case screenResume:
+				if m.cursor == len(m.resumeFiles) {
+					// "Start new copy" option selected
+					m.screen = screenSource
+					m.cursor = 0
+					m.viewportTop = 0
+				} else {
+					// Resume existing copy
+					state := m.resumeStates[m.cursor]
+					m.source = state.SourceService
+					m.target = state.TargetService
+					m.table = state.TableName
+					m.primaryKey = state.PrimaryKey
+					m.lastID = fmt.Sprintf("%d", state.LastID)
+					m.screen = screenConfirm
+					m.cursor = 0
+					m.viewportTop = 0
+				}
+
 			case screenSource:
 				m.source = m.serviceNames[m.cursor]
 				m.screen = screenTarget
@@ -188,6 +236,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case screenConfirm:
 				m.screen = screenCopying
+				m.copyInProgress = true
+				m.progressMsg = "Initializing copy..."
+				m.copiedRows = 0
+				m.totalRows = 0
+				m.progressPct = 0
+				m.progressChan = make(chan CopyProgress, 100)
 				return m, m.performCopy()
 
 			case screenDone:
@@ -258,13 +312,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case copyProgressMsg:
+		m.progressMsg = msg.message
+		m.totalRows = msg.totalRows
+		m.copiedRows = msg.copiedRows
+		m.currentLastID = msg.lastID
+		m.progressPct = msg.percentage
+		// Keep listening for more progress updates
+		return m, waitForProgress(m.progressChan)
+
 	case copyResultMsg:
 		m.result = string(msg)
+		m.copyInProgress = false
 		m.screen = screenDone
 		return m, nil
 
 	case copyErrorMsg:
 		m.err = error(msg)
+		m.copyInProgress = false
 		m.screen = screenDone
 		return m, nil
 	}
@@ -279,6 +344,57 @@ func (m model) View() string {
 	s.WriteString("\n")
 
 	switch m.screen {
+	case screenResume:
+		s.WriteString(promptStyle.Render("Resume existing copy or start new?"))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d existing operations)", len(m.resumeFiles))))
+		s.WriteString("\n\n")
+
+		// Show scroll indicator at top
+		if m.viewportTop > 0 {
+			s.WriteString(normalStyle.Render("  ⬆ ... "))
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more above)", m.viewportTop)))
+			s.WriteString("\n")
+		}
+
+		// Show visible items
+		totalItems := len(m.resumeFiles) + 1 // +1 for "Start new copy"
+		start := m.viewportTop
+		end := m.viewportTop + m.viewportSize
+		if end > totalItems {
+			end = totalItems
+		}
+
+		for i := start; i < end; i++ {
+			if i == len(m.resumeFiles) {
+				// "Start new copy" option
+				if i == m.cursor {
+					s.WriteString(selectedStyle.Render("▸ ✨ Start new copy"))
+				} else {
+					s.WriteString(normalStyle.Render("  ✨ Start new copy"))
+				}
+				s.WriteString("\n")
+			} else {
+				// Existing copy operation
+				state := m.resumeStates[i]
+				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d)",
+					state.SourceService, state.TargetService, state.TableName, state.LastID)
+				if i == m.cursor {
+					s.WriteString(selectedStyle.Render("▸ " + label))
+				} else {
+					s.WriteString(normalStyle.Render("  " + label))
+				}
+				s.WriteString("\n")
+			}
+		}
+
+		// Show scroll indicator at bottom
+		if end < totalItems {
+			s.WriteString(normalStyle.Render("  ⬇ ... "))
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", totalItems-end)))
+			s.WriteString("\n")
+		}
+
 	case screenSource:
 		s.WriteString(promptStyle.Render("Select source service:"))
 		s.WriteString("\n")
@@ -448,11 +564,34 @@ func (m model) View() string {
 		s.WriteString(promptStyle.Render("Press Enter to start copy, \\ to go back"))
 
 	case screenCopying:
-		s.WriteString(titleStyle.Render("Copying..."))
+		s.WriteString(titleStyle.Render("Copying Data"))
 		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render("Copy in progress. This may take a while..."))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render("(Output is being streamed above)"))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString("\n\n")
+
+		if m.totalRows > 0 {
+			// Progress bar
+			barWidth := 50
+			filled := int(float64(barWidth) * m.progressPct / 100.0)
+			if filled > barWidth {
+				filled = barWidth
+			}
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
+			s.WriteString("\n\n")
+
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Copied: %s / %s rows",
+				formatNumber(m.copiedRows), formatNumber(m.totalRows))))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Last ID: %d", m.currentLastID)))
+			s.WriteString("\n\n")
+		}
+
+		s.WriteString(promptStyle.Render(m.progressMsg))
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render("Press esc to cancel (copy will resume from last checkpoint)"))
 
 	case screenDone:
 		if m.err != nil {
@@ -478,26 +617,75 @@ func (m model) View() string {
 
 type copyResultMsg string
 type copyErrorMsg error
+type copyProgressMsg struct {
+	message    string
+	totalRows  int64
+	copiedRows int64
+	lastID     int64
+	percentage float64
+}
 
 func (m model) performCopy() tea.Cmd {
-	return func() tea.Msg {
-		sourceConfig := m.services[m.source]
-		targetConfig := m.services[m.target]
+	sourceConfig := m.services[m.source]
+	targetConfig := m.services[m.target]
 
-		// Parse lastID
-		var lastID int64 = 1
-		if m.lastID != "" {
-			if parsed, err := strconv.ParseInt(m.lastID, 10, 64); err == nil {
-				lastID = parsed
-			}
+	// Parse lastID
+	var lastID int64 = 1
+	if m.lastID != "" {
+		if parsed, err := strconv.ParseInt(m.lastID, 10, 64); err == nil {
+			lastID = parsed
 		}
-
-		err := CopyTable(m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID)
-		if err != nil {
-			return copyErrorMsg(err)
-		}
-		return copyResultMsg("Table copied successfully!")
 	}
+
+	// Start copy in goroutine
+	go func() {
+		err := CopyTableWithProgress(m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, m.progressChan)
+		if err != nil {
+			m.progressChan <- CopyProgress{Error: err}
+		}
+		close(m.progressChan)
+	}()
+
+	// Return a command that listens to progress
+	return waitForProgress(m.progressChan)
+}
+
+func waitForProgress(progressChan chan CopyProgress) tea.Cmd {
+	return func() tea.Msg {
+		progress, ok := <-progressChan
+		if !ok {
+			// Channel closed
+			return copyResultMsg("Table copied successfully!")
+		}
+
+		if progress.Error != nil {
+			return copyErrorMsg(progress.Error)
+		}
+
+		if progress.Done {
+			return copyResultMsg("Table copied successfully!")
+		}
+
+		return copyProgressMsg{
+			message:    progress.Message,
+			totalRows:  progress.TotalRows,
+			copiedRows: progress.CopiedRows,
+			lastID:     progress.LastID,
+			percentage: progress.Percentage,
+		}
+	}
+}
+
+func formatNumber(n int64) string {
+	str := fmt.Sprintf("%d", n)
+	var result strings.Builder
+	for i, c := range str {
+		if i > 0 && (len(str)-i)%3 == 0 {
+			result.WriteRune(',')
+		}
+		result.WriteRune(c)
+	}
+	return result.String()
 }
 
 func fetchTables(config ServiceConfig) ([]string, error) {
