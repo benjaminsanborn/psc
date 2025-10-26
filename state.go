@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // LoadCopyState loads the copy state from a JSON file
@@ -48,34 +47,4 @@ func FindAllCopyStateFiles() ([]string, error) {
 	}
 
 	return stateFiles, nil
-}
-
-// DisplayCopyStateFiles displays information about existing copy state files
-func DisplayCopyStateFiles(files []string) {
-	if len(files) == 0 {
-		return
-	}
-
-	fmt.Println("\n⚠️  Found existing copy operations:")
-	fmt.Println(strings.Repeat("─", 80))
-
-	for _, file := range files {
-		state, err := LoadCopyState(file)
-		if err != nil {
-			continue
-		}
-
-		fmt.Printf("📄 %s\n", file)
-		fmt.Printf("   Source: %s → Target: %s\n", state.SourceService, state.TargetService)
-		fmt.Printf("   Table: %s (Primary Key: %s)\n", state.TableName, state.PrimaryKey)
-		fmt.Printf("   Last ID: %d\n", state.LastID)
-		fmt.Printf("   Started: %s\n", state.StartTime)
-		fmt.Printf("   Updated: %s\n", state.LastUpdate)
-		fmt.Printf("   Resume: psc -source %s -target %s -table %s -primary-key %s -last-id %d\n",
-			state.SourceService, state.TargetService, state.TableName, state.PrimaryKey, state.LastID)
-		fmt.Println()
-	}
-
-	fmt.Println(strings.Repeat("─", 80))
-	fmt.Println()
 }
