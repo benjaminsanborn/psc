@@ -51,6 +51,8 @@ type model struct {
 	progressPct    float64
 	copyInProgress bool
 	progressChan   chan CopyProgress
+	filterText     string
+	filteredItems  []string
 }
 
 var (
@@ -161,9 +163,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case screenResume:
 				maxItems = len(m.resumeFiles) + 1 // +1 for "Start new copy" option
 			case screenSource, screenTarget:
-				maxItems = len(m.serviceNames)
+				if len(m.filterText) > 0 {
+					maxItems = len(m.filteredItems)
+				} else {
+					maxItems = len(m.serviceNames)
+				}
 			case screenTable:
-				maxItems = len(m.tables)
+				if len(m.filterText) > 0 {
+					maxItems = len(m.filteredItems)
+				} else {
+					maxItems = len(m.tables)
+				}
 			default:
 				maxItems = 0
 			}
@@ -184,6 +194,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.screen = screenSource
 					m.cursor = 0
 					m.viewportTop = 0
+					m.filterText = ""
+					m.filteredItems = nil
 				} else {
 					// Resume existing copy
 					state := m.resumeStates[m.cursor]
@@ -198,13 +210,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case screenSource:
-				m.source = m.serviceNames[m.cursor]
+				if len(m.filterText) > 0 {
+					m.source = m.filteredItems[m.cursor]
+				} else {
+					m.source = m.serviceNames[m.cursor]
+				}
 				m.screen = screenTarget
 				m.cursor = 0
 				m.viewportTop = 0
+				m.filterText = ""
+				m.filteredItems = nil
 
 			case screenTarget:
-				m.target = m.serviceNames[m.cursor]
+				if len(m.filterText) > 0 {
+					m.target = m.filteredItems[m.cursor]
+				} else {
+					m.target = m.serviceNames[m.cursor]
+				}
 				if m.target == m.source {
 					m.err = fmt.Errorf("target must be different from source")
 					return m, nil
@@ -221,9 +243,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenTable
 				m.cursor = 0
 				m.viewportTop = 0
+				m.filterText = ""
+				m.filteredItems = nil
 
 			case screenTable:
-				m.table = m.tables[m.cursor]
+				if len(m.filterText) > 0 {
+					m.table = m.filteredItems[m.cursor]
+				} else {
+					m.table = m.tables[m.cursor]
+				}
 				m.screen = screenPrimaryKey
 				m.cursor = 0
 				m.viewportTop = 0
@@ -274,7 +302,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "backspace":
-			// Handle backspace in text input fields for deleting characters
+			// Handle backspace in text input fields and filters
 			if m.screen == screenPrimaryKey {
 				if len(m.primaryKey) > 0 {
 					m.primaryKey = m.primaryKey[:len(m.primaryKey)-1]
@@ -285,6 +313,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(m.lastID) == 0 {
 						m.lastID = "1" // Reset to default
 					}
+				}
+			} else if m.screen == screenSource || m.screen == screenTarget || m.screen == screenTable {
+				// Handle filter backspace
+				if len(m.filterText) > 0 {
+					m.filterText = m.filterText[:len(m.filterText)-1]
+					m.cursor = 0
+					m.viewportTop = 0
+					m.updateFilter()
 				}
 			}
 
@@ -308,6 +344,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.lastID += msg.String()
 					}
+				}
+			}
+			// Handle filter text input for source/target/table screens
+			if m.screen == screenSource || m.screen == screenTarget || m.screen == screenTable {
+				if len(msg.String()) == 1 && (msg.String()[0] >= 'a' && msg.String()[0] <= 'z' ||
+					msg.String()[0] >= 'A' && msg.String()[0] <= 'Z' ||
+					msg.String()[0] >= '0' && msg.String()[0] <= '9' ||
+					msg.String()[0] == '_' || msg.String()[0] == '-') {
+					m.filterText += msg.String()
+					m.cursor = 0
+					m.viewportTop = 0
+					m.updateFilter()
 				}
 			}
 		}
@@ -335,6 +383,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *model) updateFilter() {
+	var sourceList []string
+	switch m.screen {
+	case screenSource, screenTarget:
+		sourceList = m.serviceNames
+	case screenTable:
+		sourceList = m.tables
+	default:
+		return
+	}
+
+	if m.filterText == "" {
+		m.filteredItems = nil
+		return
+	}
+
+	m.filteredItems = nil
+	filterLower := strings.ToLower(m.filterText)
+	for _, item := range sourceList {
+		if strings.Contains(strings.ToLower(item), filterLower) {
+			m.filteredItems = append(m.filteredItems, item)
+		}
+	}
 }
 
 func (m model) View() string {
@@ -398,7 +471,15 @@ func (m model) View() string {
 	case screenSource:
 		s.WriteString(promptStyle.Render("Select source service:"))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d services)", len(m.serviceNames))))
+
+		displayList := m.serviceNames
+		if len(m.filterText) > 0 {
+			displayList = m.filteredItems
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d of %d services) Filter: ", len(displayList), len(m.serviceNames))))
+			s.WriteString(selectedStyle.Render(m.filterText))
+		} else {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d services)", len(m.serviceNames))))
+		}
 		s.WriteString("\n\n")
 
 		// Show scroll indicator at top
@@ -411,12 +492,12 @@ func (m model) View() string {
 		// Show visible items
 		start := m.viewportTop
 		end := m.viewportTop + m.viewportSize
-		if end > len(m.serviceNames) {
-			end = len(m.serviceNames)
+		if end > len(displayList) {
+			end = len(displayList)
 		}
 
 		for i := start; i < end; i++ {
-			name := m.serviceNames[i]
+			name := displayList[i]
 			if i == m.cursor {
 				s.WriteString(selectedStyle.Render("▸ " + name))
 			} else {
@@ -426,9 +507,9 @@ func (m model) View() string {
 		}
 
 		// Show scroll indicator at bottom
-		if end < len(m.serviceNames) {
+		if end < len(displayList) {
 			s.WriteString(normalStyle.Render("  ⬇ ... "))
-			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(m.serviceNames)-end)))
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(displayList)-end)))
 			s.WriteString("\n")
 		}
 
@@ -437,7 +518,15 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Select target service:"))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d services)", len(m.serviceNames))))
+
+		displayList := m.serviceNames
+		if len(m.filterText) > 0 {
+			displayList = m.filteredItems
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d of %d services) Filter: ", len(displayList), len(m.serviceNames))))
+			s.WriteString(selectedStyle.Render(m.filterText))
+		} else {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d services)", len(m.serviceNames))))
+		}
 		s.WriteString("\n\n")
 
 		// Show scroll indicator at top
@@ -450,12 +539,12 @@ func (m model) View() string {
 		// Show visible items
 		start := m.viewportTop
 		end := m.viewportTop + m.viewportSize
-		if end > len(m.serviceNames) {
-			end = len(m.serviceNames)
+		if end > len(displayList) {
+			end = len(displayList)
 		}
 
 		for i := start; i < end; i++ {
-			name := m.serviceNames[i]
+			name := displayList[i]
 			if i == m.cursor {
 				s.WriteString(selectedStyle.Render("▸ " + name))
 			} else {
@@ -465,9 +554,9 @@ func (m model) View() string {
 		}
 
 		// Show scroll indicator at bottom
-		if end < len(m.serviceNames) {
+		if end < len(displayList) {
 			s.WriteString(normalStyle.Render("  ⬇ ... "))
-			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(m.serviceNames)-end)))
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(displayList)-end)))
 			s.WriteString("\n")
 		}
 
@@ -481,7 +570,15 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Select table to copy:"))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d tables)", len(m.tables))))
+
+		displayList := m.tables
+		if len(m.filterText) > 0 {
+			displayList = m.filteredItems
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d of %d tables) Filter: ", len(displayList), len(m.tables))))
+			s.WriteString(selectedStyle.Render(m.filterText))
+		} else {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d tables)", len(m.tables))))
+		}
 		s.WriteString("\n\n")
 
 		if len(m.tables) == 0 {
@@ -497,12 +594,12 @@ func (m model) View() string {
 			// Show visible items
 			start := m.viewportTop
 			end := m.viewportTop + m.viewportSize
-			if end > len(m.tables) {
-				end = len(m.tables)
+			if end > len(displayList) {
+				end = len(displayList)
 			}
 
 			for i := start; i < end; i++ {
-				name := m.tables[i]
+				name := displayList[i]
 				if i == m.cursor {
 					s.WriteString(selectedStyle.Render("▸ " + name))
 				} else {
@@ -512,9 +609,9 @@ func (m model) View() string {
 			}
 
 			// Show scroll indicator at bottom
-			if end < len(m.tables) {
+			if end < len(displayList) {
 				s.WriteString(normalStyle.Render("  ⬇ ... "))
-				s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(m.tables)-end)))
+				s.WriteString(normalStyle.Render(fmt.Sprintf("(%d more below)", len(displayList)-end)))
 				s.WriteString("\n")
 			}
 		}
