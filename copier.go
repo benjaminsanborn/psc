@@ -3,13 +3,14 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	_ "github.com/lib/pq"
 )
 
 // CopyTable copies a table from source to target database
-func CopyTable(source, target ServiceConfig, tableName string) error {
+func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string) error {
 	// Connect to source
 	sourceDB, err := sql.Open("postgres", source.ConnectionString())
 	if err != nil {
@@ -35,7 +36,6 @@ func CopyTable(source, target ServiceConfig, tableName string) error {
 	// Check if table exists on target
 	var exists bool
 	checkSQL := "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)"
-	fmt.Printf("SQL: %s\n", checkSQL)
 	if err := targetDB.QueryRow(checkSQL, tableName).Scan(&exists); err != nil {
 		return fmt.Errorf("failed to check if table exists: %w", err)
 	}
@@ -45,11 +45,23 @@ func CopyTable(source, target ServiceConfig, tableName string) error {
 
 	// Copy data
 	fmt.Printf("Copying data...\n")
-	return copyData(sourceDB, targetDB, tableName)
+	return copyData(sourceName, targetName, sourceDB, targetDB, tableName, primaryKey)
 }
 
-// copyData copies all rows from source to target
-func copyData(sourceDB, targetDB *sql.DB, tableName string) error {
+// copyData copies all rows from source to target using COPY commands in chunks
+func copyData(sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string) error {
+	// Get estimated row count
+	var estimatedRows int64
+	countSQL := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE relname = '%s'", tableName)
+	if err := sourceDB.QueryRow(countSQL).Scan(&estimatedRows); err != nil {
+		// Fallback to COUNT(*) if estimate not available
+		countSQL = fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
+		if err := sourceDB.QueryRow(countSQL).Scan(&estimatedRows); err != nil {
+			return fmt.Errorf("failed to get row count: %w", err)
+		}
+	}
+	fmt.Printf("Estimated rows: %d\n", estimatedRows)
+
 	// Get column names
 	query := `
 		SELECT column_name
@@ -57,7 +69,6 @@ func copyData(sourceDB, targetDB *sql.DB, tableName string) error {
 		WHERE table_name = $1
 		ORDER BY ordinal_position
 	`
-
 	rows, err := sourceDB.Query(query, tableName)
 	if err != nil {
 		return err
@@ -74,53 +85,144 @@ func copyData(sourceDB, targetDB *sql.DB, tableName string) error {
 	}
 	rows.Close()
 
-	// Read all data from source
-	selectSQL := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
-	fmt.Printf("SQL: %s\n", selectSQL)
-	dataRows, err := sourceDB.Query(selectSQL)
+	if len(columns) == 0 {
+		return fmt.Errorf("no columns found for table %s", tableName)
+	}
+
+	fmt.Printf("Using column '%s' for chunking\n", idColumn)
+
+	// Copy data in chunks
+	chunkSize := 1000
+	lastMaxID := interface{}(nil)
+	totalCopied := 0
+
+	for {
+		copied, newMaxID, err := copyChunk(sourceName, targetName, sourceDB, tableName, idColumn, lastMaxID, chunkSize)
+		if err != nil {
+			return fmt.Errorf("failed to copy chunk (lastMaxID=%v): %w", lastMaxID, err)
+		}
+
+		if copied == 0 {
+			break
+		}
+
+		// Only update pointer after successful copy
+		lastMaxID = newMaxID
+		totalCopied += copied
+
+		fmt.Printf("Progress: %d/%d rows (%.1f%%)\n", totalCopied, estimatedRows,
+			float64(totalCopied)/float64(estimatedRows)*100)
+
+		if copied < chunkSize {
+			break
+		}
+	}
+
+	fmt.Printf("Total rows copied: %d\n", totalCopied)
+	return nil
+}
+
+// copyChunk copies a single chunk of data using psql COPY with binary format
+func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string,
+	idColumn string, lastMaxID interface{}, chunkSize int) (int, interface{}, error) {
+
+	// Determine the ID range for this chunk
+	var startID, endID interface{}
+	var rowCount int
+
+	if lastMaxID == nil {
+		// First chunk - get the first chunkSize IDs
+		query := fmt.Sprintf("SELECT MIN(%s), MAX(%s), COUNT(*) FROM (SELECT %s FROM %s ORDER BY %s LIMIT %d) t",
+			idColumn, idColumn, idColumn, tableName, idColumn, chunkSize)
+		fmt.Printf("SQL: %s\n", query)
+		err := sourceDB.QueryRow(query).Scan(&startID, &endID, &rowCount)
+		if err == sql.ErrNoRows || rowCount == 0 {
+			return 0, nil, nil
+		}
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed to get first chunk range: %w", err)
+		}
+	} else {
+		// Subsequent chunks - get next chunkSize IDs after lastMaxID
+		query := fmt.Sprintf("SELECT MIN(%s), MAX(%s), COUNT(*) FROM (SELECT %s FROM %s WHERE %s > $1 ORDER BY %s LIMIT %d) t",
+			idColumn, idColumn, idColumn, tableName, idColumn, idColumn, chunkSize)
+		fmt.Printf("SQL: %s\n", query)
+		err := sourceDB.QueryRow(query, lastMaxID).Scan(&startID, &endID, &rowCount)
+		if err == sql.ErrNoRows || rowCount == 0 {
+			return 0, nil, nil
+		}
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed to get chunk range: %w", err)
+		}
+	}
+
+	if rowCount == 0 {
+		return 0, nil, nil
+	}
+
+	// Build the COPY command
+	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s BETWEEN %v AND %v) TO STDOUT (FORMAT binary)",
+		tableName, idColumn, startID, endID)
+	fmt.Printf("SQL: %s\n", copySQL)
+
+	// Build psql commands
+	sourceCmd := exec.Command("psql", fmt.Sprintf("service=%s", sourceName), "-Atc", copySQL)
+	targetCmd := exec.Command("psql", fmt.Sprintf("service=%s", targetName), "-c",
+		fmt.Sprintf("COPY %s FROM STDIN (FORMAT binary)", tableName))
+
+	// Pipe source to target
+	pipe, err := sourceCmd.StdoutPipe()
 	if err != nil {
-		return err
+		return 0, nil, fmt.Errorf("failed to create pipe: %w", err)
 	}
-	defer dataRows.Close()
+	targetCmd.Stdin = pipe
 
-	// Prepare insert statement
-	placeholders := make([]string, len(columns))
-	for i := range placeholders {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		tableName, strings.Join(columns, ", "), strings.Join(placeholders, ", "))
-	fmt.Printf("SQL: %s\n", insertSQL)
+	// Capture error and output
+	sourceCmdErr := &strings.Builder{}
+	targetCmdErr := &strings.Builder{}
+	targetCmdOut := &strings.Builder{}
+	sourceCmd.Stderr = sourceCmdErr
+	targetCmd.Stderr = targetCmdErr
+	targetCmd.Stdout = targetCmdOut
 
-	stmt, err := targetDB.Prepare(insertSQL)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	// Copy rows
-	rowCount := 0
-	for dataRows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := dataRows.Scan(valuePtrs...); err != nil {
-			return err
-		}
-
-		if _, err := stmt.Exec(values...); err != nil {
-			return fmt.Errorf("failed to insert row: %w", err)
-		}
-		rowCount++
-
-		if rowCount%1000 == 0 {
-			fmt.Printf("Copied %d rows...\n", rowCount)
-		}
+	// Start target first
+	if err := targetCmd.Start(); err != nil {
+		return 0, nil, fmt.Errorf("failed to start target psql: %w", err)
 	}
 
-	fmt.Printf("Total rows copied: %d\n", rowCount)
-	return dataRows.Err()
+	// Start source
+	if err := sourceCmd.Start(); err != nil {
+		targetCmd.Process.Kill()
+		return 0, nil, fmt.Errorf("failed to start source psql: %w", err)
+	}
+
+	// Wait for source to finish
+	if err := sourceCmd.Wait(); err != nil {
+		targetCmd.Process.Kill()
+		return 0, nil, fmt.Errorf("source psql failed: %w, stderr: %s", err, sourceCmdErr.String())
+	}
+
+	// Close the pipe
+	pipe.Close()
+
+	// Wait for target to finish
+	if err := targetCmd.Wait(); err != nil {
+		return 0, nil, fmt.Errorf("target psql failed: %w, stderr: %s", err, targetCmdErr.String())
+	}
+
+	// Print output from commands
+	if sourceCmdErr.Len() > 0 {
+		fmt.Printf("Source stderr: %s\n", sourceCmdErr.String())
+	}
+	if targetCmdErr.Len() > 0 {
+		fmt.Printf("Target stderr: %s\n", targetCmdErr.String())
+	}
+	if targetCmdOut.Len() > 0 {
+		fmt.Printf("Target stdout: %s\n", targetCmdOut.String())
+	}
+
+	fmt.Printf("Shell: psql service=%s -Atc \"%s\" | psql service=%s -c \"COPY %s FROM STDIN (FORMAT binary)\"\n",
+		sourceName, copySQL, targetName, tableName)
+
+	return rowCount, endID, nil
 }

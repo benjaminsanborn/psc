@@ -11,7 +11,7 @@ func main() {
 	source := flag.String("source", "", "Source service name from pg_service.conf")
 	target := flag.String("target", "", "Target service name from pg_service.conf")
 	table := flag.String("table", "", "Table name to copy")
-	serviceFile := flag.String("service-file", "", "Path to pg_service.conf (optional, defaults to ~/.pg_service.conf)")
+	primaryKey := flag.String("primary-key", "id", "Primary key column for chunking (defaults to 'id')")
 
 	flag.Parse()
 
@@ -22,14 +22,11 @@ func main() {
 	}
 
 	// Determine service file path
-	configPath := *serviceFile
-	if configPath == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatalf("Failed to get home directory: %v", err)
-		}
-		configPath = fmt.Sprintf("%s/.pg_service.conf", home)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Failed to get home directory: %v", err)
 	}
+	configPath := fmt.Sprintf("%s/.pg_service.conf", home)
 
 	// Parse service file
 	services, err := ParseServiceFile(configPath)
@@ -49,7 +46,7 @@ func main() {
 
 	// Copy table
 	fmt.Printf("Copying table '%s' from '%s' to '%s'...\n", *table, *source, *target)
-	if err := CopyTable(sourceConfig, targetConfig, *table); err != nil {
+	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *primaryKey); err != nil {
 		log.Fatalf("Failed to copy table: %v", err)
 	}
 
