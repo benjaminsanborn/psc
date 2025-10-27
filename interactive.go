@@ -63,6 +63,8 @@ type model struct {
 	cancelCopy          context.CancelFunc
 	filterText          string
 	filteredItems       []string
+	confirmDelete       bool
+	deleteIndex         int
 }
 
 var (
@@ -176,6 +178,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up", "k":
+			m.confirmDelete = false
+			m.deleteIndex = -1
 			if m.cursor > 0 {
 				m.cursor--
 				// Adjust viewport if cursor moves above visible area
@@ -185,6 +189,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down", "j":
+			m.confirmDelete = false
+			m.deleteIndex = -1
 			var maxItems int
 			switch m.screen {
 			case screenResume:
@@ -213,9 +219,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "x":
+			// Delete state file on resume screen
+			if m.screen == screenResume && m.cursor < len(m.resumeFiles) {
+				if m.confirmDelete && m.deleteIndex == m.cursor {
+					// Confirmed - delete the file
+					fileToDelete := m.resumeFiles[m.cursor]
+					if err := os.Remove(fileToDelete); err != nil {
+						m.err = fmt.Errorf("failed to delete state file: %w", err)
+						return m, nil
+					}
+
+					// Refresh the list
+					resumeFiles, _ := FindAllCopyStateFiles()
+					var resumeStates []*CopyState
+					for _, file := range resumeFiles {
+						if state, err := LoadCopyState(file); err == nil {
+							resumeStates = append(resumeStates, state)
+						}
+					}
+					m.resumeFiles = resumeFiles
+					m.resumeStates = resumeStates
+
+					// Reset cursor if needed
+					if m.cursor >= len(m.resumeFiles) && len(m.resumeFiles) > 0 {
+						m.cursor = len(m.resumeFiles) - 1
+					}
+					if len(m.resumeFiles) == 0 {
+						m.cursor = 0
+					}
+
+					m.confirmDelete = false
+					m.deleteIndex = -1
+				} else {
+					// Ask for confirmation
+					m.confirmDelete = true
+					m.deleteIndex = m.cursor
+				}
+			}
+
 		case "enter":
 			switch m.screen {
 			case screenResume:
+				m.confirmDelete = false
+				m.deleteIndex = -1
+
 				if m.cursor == len(m.resumeFiles) {
 					// "Start new copy" option selected
 					m.screen = screenSource
@@ -519,7 +567,7 @@ func (m model) View() string {
 	case screenResume:
 		s.WriteString(promptStyle.Render("Resume existing copy or start new?"))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d existing operations)", len(m.resumeFiles))))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("(%d existing operations: x to delete)", len(m.resumeFiles))))
 		s.WriteString("\n\n")
 
 		// Show scroll indicator at top
@@ -559,7 +607,11 @@ func (m model) View() string {
 				}
 				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
 					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo, parallelInfo)
-				if i == m.cursor {
+
+				if m.confirmDelete && m.deleteIndex == i {
+					// Show delete confirmation
+					s.WriteString(errorStyle.Render("▸ ⚠️  Press 'x' again to confirm deletion"))
+				} else if i == m.cursor {
 					s.WriteString(selectedStyle.Render("▸ " + label))
 				} else {
 					s.WriteString(normalStyle.Render("  " + label))
