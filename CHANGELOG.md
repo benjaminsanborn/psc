@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/benjaminsanborn/psc/compare/v1.1.0...v1.2.0) (2025-10-27)
+
+
+### Features
+
+* confirm to quit ([f00ab3a](https://github.com/benjaminsanborn/psc/commit/f00ab3a7031e50602c085b4bea2566a950f434fa))
+
 # [1.1.0](https://github.com/benjaminsanborn/psc/compare/v1.0.0...v1.1.0) (2025-10-27)
 
 
