@@ -312,6 +312,15 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		sendProgress(msg, estimatedRows, totalCopied, highestCompletedID, percentage)
 	}
 
+	// Check for errors first
+	mu.Lock()
+	hasErrors := len(errors) > 0
+	mu.Unlock()
+
+	if hasErrors {
+		return fmt.Errorf("copy completed with %d error(s): \n%s", len(errors), strings.Join(errors, "; "))
+	}
+
 	// Check if cancelled
 	select {
 	case <-ctx.Done():
@@ -320,16 +329,8 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		lastIDFinal := highestCompletedID
 		mu.Unlock()
 		sendProgress(fmt.Sprintf("Copy cancelled. Copied %d rows up to ID %d", totalCopiedFinal, lastIDFinal), estimatedRows, totalCopiedFinal, lastIDFinal, float64(totalCopiedFinal)/float64(estimatedRows)*100)
+		return fmt.Errorf("copy cancelled by user")
 	default:
-	}
-
-	// Check for errors
-	mu.Lock()
-	hasErrors := len(errors) > 0
-	mu.Unlock()
-
-	if hasErrors {
-		return fmt.Errorf("copy completed with %d error(s): \n%s", len(errors), strings.Join(errors, "; "))
 	}
 
 	sendProgress("Copy complete!", estimatedRows, totalCopied, highestCompletedID, 100)
@@ -363,8 +364,8 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 	var maxID = minID.Int64 + chunkSize
 
 	// Build the COPY query
-	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d ORDER BY %s) TO STDOUT (FORMAT binary)",
-		tableName, idColumn, minID.Int64, idColumn, maxID, idColumn)
+	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d) TO STDOUT (FORMAT binary)",
+		tableName, idColumn, minID.Int64, idColumn, maxID)
 
 	if !quiet {
 		fmt.Printf("SQL: %s\n", copySQL)
