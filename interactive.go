@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -22,40 +23,44 @@ const (
 	screenPrimaryKey
 	screenLastID
 	screenChunkSize
+	screenParallelism
 	screenConfirm
 	screenCopying
 	screenDone
 )
 
 type model struct {
-	screen          screen
-	services        map[string]ServiceConfig
-	serviceNames    []string
-	source          string
-	target          string
-	table           string
-	tables          []string
-	primaryKey      string
-	lastID          string
-	chunkSize       string
-	chunkSizeEdited bool
-	cursor          int
-	viewportTop     int
-	viewportSize    int
-	err             error
-	result          string
-	configPath      string
-	resumeFiles     []string
-	resumeStates    []*CopyState
-	progressMsg     string
-	totalRows       int64
-	copiedRows      int64
-	currentLastID   int64
-	progressPct     float64
-	copyInProgress  bool
-	progressChan    chan CopyProgress
-	filterText      string
-	filteredItems   []string
+	screen            screen
+	services          map[string]ServiceConfig
+	serviceNames      []string
+	source            string
+	target            string
+	table             string
+	tables            []string
+	primaryKey        string
+	lastID            string
+	chunkSize         string
+	chunkSizeEdited   bool
+	parallelism       string
+	parallelismEdited bool
+	cursor            int
+	viewportTop       int
+	viewportSize      int
+	err               error
+	result            string
+	configPath        string
+	resumeFiles       []string
+	resumeStates      []*CopyState
+	progressMsg       string
+	totalRows         int64
+	copiedRows        int64
+	currentLastID     int64
+	progressPct       float64
+	copyInProgress    bool
+	progressChan      chan CopyProgress
+	cancelCopy        context.CancelFunc
+	filterText        string
+	filteredItems     []string
 }
 
 var (
@@ -127,6 +132,7 @@ func runInteractive() error {
 		primaryKey:   "id",
 		lastID:       "1",
 		chunkSize:    "1000",
+		parallelism:  "1",
 		configPath:   configPath,
 		viewportSize: 10, // Show 10 items at a time
 		resumeFiles:  resumeFiles,
@@ -149,7 +155,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
+		case "ctrl+c":
+			// If copy in progress, cancel it first
+			if m.copyInProgress && m.cancelCopy != nil {
+				m.progressMsg = "Cancelling... waiting for workers to finish"
+				m.cancelCopy()
+			}
+			return m, tea.Quit
+
+		case "esc":
+			// If copying, cancel the operation
+			if m.screen == screenCopying && m.copyInProgress && m.cancelCopy != nil {
+				m.progressMsg = "Cancelling... waiting for workers to finish"
+				m.cancelCopy()
+				return m, nil
+			}
+			// Otherwise treat as quit
 			return m, tea.Quit
 
 		case "up", "k":
@@ -211,6 +232,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if state.ChunkSize > 0 {
 						m.chunkSize = fmt.Sprintf("%d", state.ChunkSize)
 					}
+					if state.Parallelism > 0 {
+						m.parallelism = fmt.Sprintf("%d", state.Parallelism)
+					}
 					m.screen = screenConfirm
 					m.cursor = 0
 					m.viewportTop = 0
@@ -270,6 +294,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenChunkSize
 
 			case screenChunkSize:
+				m.screen = screenParallelism
+
+			case screenParallelism:
 				m.screen = screenConfirm
 
 			case screenConfirm:
@@ -310,8 +337,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.viewportTop = 0
 				m.chunkSizeEdited = false
-			case screenConfirm:
+			case screenParallelism:
 				m.screen = screenChunkSize
+				m.cursor = 0
+				m.viewportTop = 0
+				m.parallelismEdited = false
+			case screenConfirm:
+				m.screen = screenParallelism
 				m.cursor = 0
 				m.viewportTop = 0
 			}
@@ -336,6 +368,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(m.chunkSize) == 0 {
 						m.chunkSize = "1000" // Reset to default
 						m.chunkSizeEdited = false
+					}
+				}
+			} else if m.screen == screenParallelism {
+				if len(m.parallelism) > 0 {
+					m.parallelism = m.parallelism[:len(m.parallelism)-1]
+					m.parallelismEdited = true
+					if len(m.parallelism) == 0 {
+						m.parallelism = "1" // Reset to default
+						m.parallelismEdited = false
 					}
 				}
 			} else if m.screen == screenSource || m.screen == screenTarget || m.screen == screenTable {
@@ -384,6 +425,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			// Handle numeric input for parallelism
+			if m.screen == screenParallelism {
+				if len(msg.String()) == 1 && msg.String()[0] >= '0' && msg.String()[0] <= '9' {
+					// Only allow digits
+					if !m.parallelismEdited && m.parallelism == "1" {
+						// Replace default "1" with first digit
+						m.parallelism = msg.String()
+						m.parallelismEdited = true
+					} else {
+						m.parallelism += msg.String()
+						m.parallelismEdited = true
+					}
+				}
+			}
 			// Handle filter text input for source/target/table screens
 			if m.screen == screenSource || m.screen == screenTarget || m.screen == screenTable {
 				if len(msg.String()) == 1 && (msg.String()[0] >= 'a' && msg.String()[0] <= 'z' ||
@@ -410,12 +465,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case copyResultMsg:
 		m.result = string(msg)
 		m.copyInProgress = false
+		m.cancelCopy = nil
 		m.screen = screenDone
 		return m, nil
 
 	case copyErrorMsg:
 		m.err = error(msg)
 		m.copyInProgress = false
+		m.cancelCopy = nil
 		m.screen = screenDone
 		return m, nil
 	}
@@ -492,8 +549,12 @@ func (m model) View() string {
 				if state.ChunkSize > 0 {
 					chunkInfo = fmt.Sprintf(", chunk: %d", state.ChunkSize)
 				}
-				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s)",
-					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo)
+				parallelInfo := ""
+				if state.Parallelism > 1 {
+					parallelInfo = fmt.Sprintf(", workers: %d", state.Parallelism)
+				}
+				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
+					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo, parallelInfo)
 				if i == m.cursor {
 					s.WriteString(selectedStyle.Render("▸ " + label))
 				} else {
@@ -702,6 +763,23 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue (default: 1000)"))
 
+	case screenParallelism:
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Chunk Size: %s", m.chunkSize)))
+		s.WriteString("\n\n")
+		s.WriteString(promptStyle.Render("Enter parallelism (concurrent workers):"))
+		s.WriteString("\n\n")
+		s.WriteString(selectedStyle.Render(m.parallelism))
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render("Press Enter to continue (default: 1, max recommended: 10)"))
+
 	case screenConfirm:
 		s.WriteString(titleStyle.Render("Confirm Copy Operation"))
 		s.WriteString("\n\n")
@@ -716,6 +794,8 @@ func (m model) View() string {
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Chunk Size:  %s rows", m.chunkSize)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Parallelism: %s workers", m.parallelism)))
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Press Enter to start copy, \\ to go back"))
 
@@ -781,7 +861,7 @@ type copyProgressMsg struct {
 	percentage float64
 }
 
-func (m model) performCopy() tea.Cmd {
+func (m *model) performCopy() tea.Cmd {
 	sourceConfig := m.services[m.source]
 	targetConfig := m.services[m.target]
 
@@ -801,9 +881,21 @@ func (m model) performCopy() tea.Cmd {
 		}
 	}
 
+	// Parse parallelism
+	var parallelism int = 1
+	if m.parallelism != "" {
+		if parsed, err := strconv.Atoi(m.parallelism); err == nil {
+			parallelism = parsed
+		}
+	}
+
+	// Create context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelCopy = cancel
+
 	// Start copy in goroutine
 	go func() {
-		err := CopyTableWithProgress(m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, chunkSize, m.progressChan)
+		err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, chunkSize, parallelism, m.progressChan)
 		if err != nil {
 			m.progressChan <- CopyProgress{Error: err}
 		}
