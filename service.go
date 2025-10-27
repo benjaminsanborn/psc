@@ -84,8 +84,12 @@ func ParseServiceFile(path string) (map[string]ServiceConfig, error) {
 	return services, nil
 }
 
-// ConnectionString generates a PostgreSQL connection string
+// ConnectionString generates a PostgreSQL connection string with SSL required
 func (c ServiceConfig) ConnectionString() string {
-	return fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=require",
-		c.Host, c.Port, c.DBName, c.User, c.Password)
+	return c.ConnectionStringWithSSL("require")
+}
+
+// ConnectionStringWithSSL generates a PostgreSQL connection string with specified SSL mode
+func (c ServiceConfig) ConnectionStringWithSSL(sslmode string) string {
+	return fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s", c.Host, c.Port, c.DBName, c.User, c.Password, sslmode)
 }

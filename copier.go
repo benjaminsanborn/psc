@@ -71,27 +71,19 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 	}
 	sendProgress("Connecting to databases...", 0, 0, 0, 0)
 
-	// Connect to source
-	sourceDB, err := sql.Open("postgres", source.ConnectionString())
+	// Connect to source with SSL retry logic
+	sourceDB, err := connectWithSSLRetry(source, "source", sendProgress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to source: %w", err)
+		return err
 	}
 	defer sourceDB.Close()
 
-	if err := sourceDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping source database: %w", err)
-	}
-
-	// Connect to target
-	targetDB, err := sql.Open("postgres", target.ConnectionString())
+	// Connect to target with SSL retry logic
+	targetDB, err := connectWithSSLRetry(target, "target", sendProgress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to target: %w", err)
+		return err
 	}
 	defer targetDB.Close()
-
-	if err := targetDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping target database: %w", err)
-	}
 
 	sendProgress("Checking target table...", 0, 0, 0, 0)
 
@@ -275,7 +267,7 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		// Handle error
 		if result.err != nil {
 			mu.Lock()
-			errMsg := fmt.Sprintf("Error copying chunk starting at %d: %v", result.startID, result.err)
+			errMsg := fmt.Sprintf("Error copying chunk starting at %d: \n%v", result.startID, result.err)
 			errors = append(errors, errMsg)
 			state.Errors = errors
 			mu.Unlock()
@@ -328,7 +320,6 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		lastIDFinal := highestCompletedID
 		mu.Unlock()
 		sendProgress(fmt.Sprintf("Copy cancelled. Copied %d rows up to ID %d", totalCopiedFinal, lastIDFinal), estimatedRows, totalCopiedFinal, lastIDFinal, float64(totalCopiedFinal)/float64(estimatedRows)*100)
-		return fmt.Errorf("copy cancelled by user")
 	default:
 	}
 
@@ -338,7 +329,7 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 	mu.Unlock()
 
 	if hasErrors {
-		return fmt.Errorf("copy completed with %d error(s), see state file for details", len(errors))
+		return fmt.Errorf("copy completed with %d error(s): \n%s", len(errors), strings.Join(errors, "; "))
 	}
 
 	sendProgress("Copy complete!", estimatedRows, totalCopied, highestCompletedID, 100)
@@ -387,10 +378,11 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 	// Set up pipes
 	targetCmd.Stdin, _ = sourceCmd.StdoutPipe()
 
-	// Capture stderr for both commands
-	var sourceStderr, targetStderr strings.Builder
+	// Capture stderr and stdout for both commands
+	var sourceStderr, targetStderr, targetStdout strings.Builder
 	sourceCmd.Stderr = &sourceStderr
 	targetCmd.Stderr = &targetStderr
+	targetCmd.Stdout = &targetStdout
 
 	// Start target first (it will wait for input)
 	if err := targetCmd.Start(); err != nil {
@@ -400,25 +392,35 @@ func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string
 	// Start source
 	if err := sourceCmd.Run(); err != nil {
 		if !quiet {
-			fmt.Printf("Source stderr: %s\n", sourceStderr.String())
+			if sourceStderr.Len() > 0 {
+				fmt.Printf("Source stderr: %s\n", sourceStderr.String())
+			}
 		}
-		return 0, lastMaxID, fmt.Errorf("source psql failed: %w", err)
+		return 0, lastMaxID, fmt.Errorf("source psql failed: %w\nstderr: %s", err, sourceStderr.String())
 	}
 
 	// Wait for target to complete
 	if err := targetCmd.Wait(); err != nil {
 		if !quiet {
-			fmt.Printf("Target stderr: %s\n", targetStderr.String())
+			if targetStderr.Len() > 0 {
+				fmt.Printf("Target stderr: %s\n", targetStderr.String())
+			}
+			if targetStdout.Len() > 0 {
+				fmt.Printf("Target stdout: %s\n", targetStdout.String())
+			}
 		}
-		return 0, lastMaxID, fmt.Errorf("target psql failed: %w", err)
+		return 0, lastMaxID, fmt.Errorf("target psql failed: %w\nstderr: %s", err, targetStderr.String())
 	}
 
 	if !quiet {
 		if sourceStderr.Len() > 0 {
-			fmt.Printf("Source output: %s\n", sourceStderr.String())
+			fmt.Printf("Source stderr: %s\n", sourceStderr.String())
 		}
 		if targetStderr.Len() > 0 {
-			fmt.Printf("Target output: %s\n", targetStderr.String())
+			fmt.Printf("Target stderr: %s\n", targetStderr.String())
+		}
+		if targetStdout.Len() > 0 {
+			fmt.Printf("Target stdout: %s\n", targetStdout.String())
 		}
 	}
 
@@ -431,4 +433,40 @@ func saveCopyState(filename string, state *CopyState) error {
 		return err
 	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+// connectWithSSLRetry attempts to connect with SSL, and retries without SSL if the server doesn't support it
+func connectWithSSLRetry(config ServiceConfig, dbName string, sendProgress func(string, int64, int64, int64, float64)) (*sql.DB, error) {
+	// First try with SSL
+	db, err := sql.Open("postgres", config.ConnectionString())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %s database connection: %w", dbName, err)
+	}
+
+	if err := db.Ping(); err != nil {
+		// Check if it's an SSL error
+		if strings.Contains(err.Error(), "SSL is not enabled on the server") {
+			db.Close()
+			msg := fmt.Sprintf("SSL not supported on %s, retrying without SSL...", dbName)
+			sendProgress(msg, 0, 0, 0, 0)
+
+			// Retry without SSL
+			db, err = sql.Open("postgres", config.ConnectionStringWithSSL("disable"))
+			if err != nil {
+				return nil, fmt.Errorf("failed to open %s database connection (no SSL): %w", dbName, err)
+			}
+
+			if err := db.Ping(); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("failed to ping %s database (no SSL): %w", dbName, err)
+			}
+
+			return db, nil
+		}
+
+		db.Close()
+		return nil, fmt.Errorf("failed to ping %s database: %w", dbName, err)
+	}
+
+	return db, nil
 }

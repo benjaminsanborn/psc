@@ -130,7 +130,7 @@ func runInteractive() error {
 		services:     services,
 		serviceNames: serviceNames,
 		primaryKey:   "id",
-		lastID:       "1",
+		lastID:       "0",
 		chunkSize:    "1000",
 		parallelism:  "1",
 		configPath:   configPath,
@@ -403,8 +403,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenLastID {
 				if len(msg.String()) == 1 && msg.String()[0] >= '0' && msg.String()[0] <= '9' {
 					// Only allow digits
-					if m.lastID == "1" && len(m.lastID) == 1 {
-						// Replace default "1" with first digit
+					if m.lastID == "0" && len(m.lastID) == 1 {
+						// Replace default "0" with first digit
 						m.lastID = msg.String()
 					} else {
 						m.lastID += msg.String()
@@ -746,7 +746,7 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(selectedStyle.Render(m.lastID))
 		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render("Press Enter to continue (1 = start from beginning)"))
+		s.WriteString(normalStyle.Render("Press Enter to continue (0 = start from beginning)"))
 
 	case screenChunkSize:
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
@@ -945,9 +945,31 @@ func formatNumber(n int64) string {
 }
 
 func fetchTables(config ServiceConfig) ([]string, error) {
+	// Try with SSL first
 	db, err := sql.Open("postgres", config.ConnectionString())
 	if err != nil {
 		return nil, err
+	}
+
+	err = db.Ping()
+	if err != nil {
+		// Check if it's an SSL error and retry without SSL
+		if strings.Contains(err.Error(), "SSL is not enabled on the server") {
+			db.Close()
+			// Retry without SSL
+			db, err = sql.Open("postgres", config.ConnectionStringWithSSL("disable"))
+			if err != nil {
+				return nil, err
+			}
+			err = db.Ping()
+			if err != nil {
+				db.Close()
+				return nil, err
+			}
+		} else {
+			db.Close()
+			return nil, err
+		}
 	}
 	defer db.Close()
 
