@@ -345,27 +345,11 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string,
 	idColumn string, lastMaxID int64, chunkSize int64, quiet bool) (int64, int64, error) {
 
-	// Get the MIN id in this chunk
-	minIDQuery := fmt.Sprintf("SELECT MIN(%s) FROM (SELECT %s FROM %s WHERE %s >= %d ORDER BY %s LIMIT %d) t",
-		idColumn, idColumn, tableName, idColumn, lastMaxID, idColumn, chunkSize)
-	if !quiet {
-		fmt.Printf("SQL: %s\n", minIDQuery)
-	}
-
-	var minID sql.NullInt64
-	if err := sourceDB.QueryRow(minIDQuery).Scan(&minID); err != nil {
-		return 0, lastMaxID, fmt.Errorf("failed to get min ID: %w", err)
-	}
-
-	if !minID.Valid {
-		return 0, lastMaxID, nil
-	}
-
-	var maxID = minID.Int64 + chunkSize
+	var maxID = lastMaxID + chunkSize
 
 	// Build the COPY query
 	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d) TO STDOUT (FORMAT binary)",
-		tableName, idColumn, minID.Int64, idColumn, maxID)
+		tableName, idColumn, lastMaxID, idColumn, maxID)
 
 	if !quiet {
 		fmt.Printf("SQL: %s\n", copySQL)

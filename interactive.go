@@ -358,7 +358,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(m.lastID) > 0 {
 					m.lastID = m.lastID[:len(m.lastID)-1]
 					if len(m.lastID) == 0 {
-						m.lastID = "1" // Reset to default
+						m.lastID = "0" // Reset to default
 					}
 				}
 			} else if m.screen == screenChunkSize {
@@ -817,10 +817,6 @@ func (m model) View() string {
 			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
 			s.WriteString("\n\n")
-
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Copied: %s / %s rows",
-				formatNumber(m.copiedRows), formatNumber(m.totalRows))))
-			s.WriteString("\n")
 			s.WriteString(normalStyle.Render(fmt.Sprintf("Last ID: %d", m.currentLastID)))
 			s.WriteString("\n\n")
 		}
