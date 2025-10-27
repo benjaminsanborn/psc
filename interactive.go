@@ -20,10 +20,12 @@ const (
 	screenSource
 	screenTarget
 	screenTable
+	screenWhereClause
 	screenPrimaryKey
 	screenLastID
 	screenChunkSize
 	screenParallelism
+	screenTargetSetup
 	screenConfirm
 	screenCopying
 	screenDone
@@ -37,12 +39,14 @@ type model struct {
 	target              string
 	table               string
 	tables              []string
+	whereClause         string
 	primaryKey          string
 	lastID              string
 	chunkSize           string
 	chunkSizeEdited     bool
 	parallelism         string
 	parallelismEdited   bool
+	targetSetup         string
 	cursor              int
 	viewportTop         int
 	viewportSize        int
@@ -129,6 +133,9 @@ func runInteractive() error {
 		startScreen = screenResume
 	}
 
+	defaultTargetSetup := `SET synchronous_commit TO off;
+SET maintenance_work_mem TO '2GB';`
+
 	m := model{
 		screen:       startScreen,
 		services:     services,
@@ -137,6 +144,7 @@ func runInteractive() error {
 		lastID:       "0",
 		chunkSize:    "1000",
 		parallelism:  "1",
+		targetSetup:  defaultTargetSetup,
 		configPath:   configPath,
 		viewportSize: 10, // Show 10 items at a time
 		resumeFiles:  resumeFiles,
@@ -277,6 +285,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.source = state.SourceService
 					m.target = state.TargetService
 					m.table = state.TableName
+					m.whereClause = state.WhereClause
 					m.primaryKey = state.PrimaryKey
 					m.lastID = fmt.Sprintf("%d", state.LastID)
 					if state.ChunkSize > 0 {
@@ -284,6 +293,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					if state.Parallelism > 0 {
 						m.parallelism = fmt.Sprintf("%d", state.Parallelism)
+					}
+					if state.TargetSetup != "" {
+						m.targetSetup = state.TargetSetup
 					}
 					m.screen = screenConfirm
 					m.cursor = 0
@@ -333,9 +345,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.table = m.tables[m.cursor]
 				}
-				m.screen = screenPrimaryKey
+				m.screen = screenWhereClause
 				m.cursor = 0
 				m.viewportTop = 0
+
+			case screenWhereClause:
+				m.screen = screenPrimaryKey
 
 			case screenPrimaryKey:
 				m.screen = screenLastID
@@ -347,6 +362,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenParallelism
 
 			case screenParallelism:
+				m.screen = screenTargetSetup
+
+			case screenTargetSetup:
 				m.screen = screenConfirm
 
 			case screenConfirm:
@@ -374,8 +392,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenTarget
 				m.cursor = 0
 				m.viewportTop = 0
-			case screenPrimaryKey:
+			case screenWhereClause:
 				m.screen = screenTable
+				m.cursor = 0
+				m.viewportTop = 0
+			case screenPrimaryKey:
+				m.screen = screenWhereClause
 				m.cursor = 0
 				m.viewportTop = 0
 			case screenLastID:
@@ -392,15 +414,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.viewportTop = 0
 				m.parallelismEdited = false
-			case screenConfirm:
+			case screenTargetSetup:
 				m.screen = screenParallelism
+				m.cursor = 0
+				m.viewportTop = 0
+			case screenConfirm:
+				m.screen = screenTargetSetup
 				m.cursor = 0
 				m.viewportTop = 0
 			}
 
 		case "backspace":
 			// Handle backspace in text input fields and filters
-			if m.screen == screenPrimaryKey {
+			if m.screen == screenWhereClause {
+				if len(m.whereClause) > 0 {
+					m.whereClause = m.whereClause[:len(m.whereClause)-1]
+				}
+			} else if m.screen == screenTargetSetup {
+				if len(m.targetSetup) > 0 {
+					m.targetSetup = m.targetSetup[:len(m.targetSetup)-1]
+				}
+			} else if m.screen == screenPrimaryKey {
 				if len(m.primaryKey) > 0 {
 					m.primaryKey = m.primaryKey[:len(m.primaryKey)-1]
 				}
@@ -440,6 +474,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		default:
+			// Handle text input for WHERE clause
+			if m.screen == screenWhereClause {
+				if len(msg.String()) == 1 {
+					// Allow most characters for WHERE clause
+					if msg.String()[0] >= ' ' && msg.String()[0] <= '~' {
+						m.whereClause += msg.String()
+					}
+				}
+			}
+			// Handle text input for target setup
+			if m.screen == screenTargetSetup {
+				if len(msg.String()) == 1 {
+					// Allow most characters including newlines
+					if msg.String()[0] >= ' ' && msg.String()[0] <= '~' {
+						m.targetSetup += msg.String()
+					}
+				}
+				// Handle enter key for newlines
+				if msg.String() == "enter" {
+					// Check if we're not trying to submit (which would be caught above)
+					// This is a bit of a workaround since enter is also used to proceed
+					// We'll use Ctrl+Enter to add newlines
+				}
+			}
 			// Handle text input for primary key
 			if m.screen == screenPrimaryKey {
 				if len(msg.String()) == 1 && (msg.String()[0] >= 'a' && msg.String()[0] <= 'z' ||
@@ -780,11 +838,31 @@ func (m model) View() string {
 			s.WriteString(errorStyle.Render(m.err.Error()))
 		}
 
-	case screenPrimaryKey:
+	case screenWhereClause:
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
 		s.WriteString("\n\n")
+		s.WriteString(promptStyle.Render("Enter WHERE clause (optional, leave empty to copy all rows, ex. 'id < 2000'):"))
+		s.WriteString("\n\n")
+		if m.whereClause == "" {
+			s.WriteString(normalStyle.Render("[No filter - copying all rows]"))
+		} else {
+			s.WriteString(selectedStyle.Render(m.whereClause))
+		}
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render("Press Enter to continue"))
+
+	case screenPrimaryKey:
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString("\n")
+		if m.whereClause != "" {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE: %s", m.whereClause)))
+			s.WriteString("\n")
+		}
+		s.WriteString("\n")
 		s.WriteString(promptStyle.Render("Enter primary key column name:"))
 		s.WriteString("\n\n")
 		s.WriteString(selectedStyle.Render(m.primaryKey))
@@ -836,6 +914,24 @@ func (m model) View() string {
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue (default: 1, max recommended: 10)"))
 
+	case screenTargetSetup:
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString("\n\n")
+		s.WriteString(promptStyle.Render("Target session setup SQL (executed before copy):"))
+		s.WriteString("\n")
+		s.WriteString(errorStyle.Render("⚠️  Warning: Some settings can risk data integrity! Any failure will abort copy."))
+		s.WriteString("\n\n")
+		// Display the setup SQL with line wrapping
+		lines := strings.Split(m.targetSetup, "\n")
+		for _, line := range lines {
+			s.WriteString(selectedStyle.Render(line))
+			s.WriteString("\n")
+		}
+		s.WriteString("\n")
+		s.WriteString(normalStyle.Render("Press Enter to continue (clear to skip setup)"))
+
 	case screenConfirm:
 		s.WriteString(titleStyle.Render("Confirm Copy Operation"))
 		s.WriteString("\n\n")
@@ -845,6 +941,10 @@ func (m model) View() string {
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Table:       %s", m.table)))
 		s.WriteString("\n")
+		if m.whereClause != "" {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE:       %s", m.whereClause)))
+			s.WriteString("\n")
+		}
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
@@ -977,7 +1077,7 @@ func (m *model) performCopy() tea.Cmd {
 
 	// Start copy in goroutine
 	go func() {
-		err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, m.table, m.primaryKey, lastID, chunkSize, parallelism, m.progressChan)
+		err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, m.table, m.whereClause, m.primaryKey, lastID, chunkSize, parallelism, m.targetSetup, m.progressChan)
 		if err != nil {
 			m.progressChan <- CopyProgress{Error: err}
 		}

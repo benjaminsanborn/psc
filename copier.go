@@ -19,9 +19,11 @@ type CopyState struct {
 	SourceService string   `json:"source_service"`
 	TargetService string   `json:"target_service"`
 	TableName     string   `json:"table_name"`
+	WhereClause   string   `json:"where_clause,omitempty"`
 	PrimaryKey    string   `json:"primary_key"`
 	ChunkSize     int64    `json:"chunk_size"`
 	Parallelism   int      `json:"parallelism"`
+	TargetSetup   string   `json:"target_setup,omitempty"`
 	LastID        int64    `json:"last_id"` // Highest successfully completed ID
 	StartTime     string   `json:"start_time"`
 	LastUpdate    string   `json:"last_update"`
@@ -42,22 +44,22 @@ type CopyProgress struct {
 }
 
 // CopyTableWithProgress copies a table with progress updates sent to a channel
-func CopyTableWithProgress(ctx context.Context, sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64, parallelism int, progressChan chan<- CopyProgress) error {
+func CopyTableWithProgress(ctx context.Context, sourceName, targetName string, source, target ServiceConfig, tableName, whereClause, primaryKey string, lastID int64, chunkSize int64, parallelism int, targetSetup string, progressChan chan<- CopyProgress) error {
 	defer func() {
 		if r := recover(); r != nil {
 			progressChan <- CopyProgress{Error: fmt.Errorf("panic: %v", r)}
 		}
 	}()
 
-	return copyTableInternal(ctx, sourceName, targetName, source, target, tableName, primaryKey, lastID, chunkSize, parallelism, progressChan)
+	return copyTableInternal(ctx, sourceName, targetName, source, target, tableName, whereClause, primaryKey, lastID, chunkSize, parallelism, targetSetup, progressChan)
 }
 
 // CopyTable copies a table from source to target database (non-interactive version)
-func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64, parallelism int) error {
-	return copyTableInternal(context.Background(), sourceName, targetName, source, target, tableName, primaryKey, lastID, chunkSize, parallelism, nil)
+func CopyTable(sourceName, targetName string, source, target ServiceConfig, tableName, whereClause, primaryKey string, lastID int64, chunkSize int64, parallelism int, targetSetup string) error {
+	return copyTableInternal(context.Background(), sourceName, targetName, source, target, tableName, whereClause, primaryKey, lastID, chunkSize, parallelism, targetSetup, nil)
 }
 
-func copyTableInternal(ctx context.Context, sourceName, targetName string, source, target ServiceConfig, tableName, primaryKey string, lastID int64, chunkSize int64, parallelism int, progressChan chan<- CopyProgress) error {
+func copyTableInternal(ctx context.Context, sourceName, targetName string, source, target ServiceConfig, tableName, whereClause, primaryKey string, lastID int64, chunkSize int64, parallelism int, targetSetup string, progressChan chan<- CopyProgress) error {
 	sendProgress := func(msg string, totalRows, copiedRows, lastID int64, percentage float64) {
 		if progressChan != nil {
 			progressChan <- CopyProgress{
@@ -115,9 +117,11 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 		SourceService: sourceName,
 		TargetService: targetName,
 		TableName:     tableName,
+		WhereClause:   whereClause,
 		PrimaryKey:    primaryKey,
 		ChunkSize:     chunkSize,
 		Parallelism:   parallelism,
+		TargetSetup:   targetSetup,
 		LastID:        lastID,
 		StartTime:     time.Now().Format(time.RFC3339),
 		LastUpdate:    time.Now().Format(time.RFC3339),
@@ -130,9 +134,27 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 
 	sendProgress("Initializing state file...", 0, 0, 0, 0)
 
+	// Execute target setup SQL if provided
+	if targetSetup != "" {
+		sendProgress("Executing target session setup...", 0, 0, 0, 0)
+		statements := strings.Split(targetSetup, ";")
+		for i, stmt := range statements {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			if _, err := targetDB.Exec(stmt); err != nil {
+				errMsg := fmt.Sprintf("Failed to execute target setup statement %d: %s\nError: %v", i+1, stmt, err)
+				sendProgress(errMsg, 0, 0, 0, 0)
+				return fmt.Errorf("%s", errMsg)
+			}
+		}
+		sendProgress("Target session setup completed successfully", 0, 0, 0, 0)
+	}
+
 	// Copy data
 	sendProgress("Starting data copy...", 0, 0, 0, 0)
-	return copyData(ctx, sourceName, targetName, sourceDB, targetDB, tableName, primaryKey, lastID, chunkSize, parallelism, stateFile, &state, progressChan)
+	return copyData(ctx, sourceName, targetName, sourceDB, targetDB, tableName, whereClause, primaryKey, lastID, chunkSize, parallelism, stateFile, &state, progressChan)
 }
 
 // chunkResult holds the result of a chunk copy operation
@@ -145,7 +167,7 @@ type chunkResult struct {
 }
 
 // copyData copies all rows from source to target using COPY commands in chunks with parallel workers
-func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, idColumn string, startID int64, chunkSize int64, parallelism int, stateFile string, state *CopyState, progressChan chan<- CopyProgress) error {
+func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targetDB *sql.DB, tableName, whereClause, idColumn string, startID int64, chunkSize int64, parallelism int, stateFile string, state *CopyState, progressChan chan<- CopyProgress) error {
 	// Create a child context so we can still cancel internally if needed
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -264,7 +286,7 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 
 				// Copy this chunk
 				startTime := time.Now()
-				copied, actualEndID, err := copyChunk(sourceName, targetName, sourceDB, tableName, idColumn, myStartID, chunkSize, quiet)
+				copied, actualEndID, err := copyChunk(sourceName, targetName, sourceDB, tableName, whereClause, idColumn, myStartID, chunkSize, quiet)
 				elapsed := time.Since(startTime)
 
 				// Send result
@@ -377,14 +399,20 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 }
 
 // copyChunk copies a single chunk of data
-func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string,
+func copyChunk(sourceName, targetName string, sourceDB *sql.DB, tableName string, whereClause string,
 	idColumn string, lastMaxID int64, chunkSize int64, quiet bool) (int64, int64, error) {
 
 	var maxID = lastMaxID + chunkSize
 
 	// Build the COPY query
-	copySQL := fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d) TO STDOUT (FORMAT binary)",
-		tableName, idColumn, lastMaxID, idColumn, maxID)
+	var copySQL string
+	if whereClause != "" {
+		copySQL = fmt.Sprintf("COPY (SELECT * FROM %s WHERE (%s) AND %s >= %d AND %s < %d) TO STDOUT (FORMAT binary)",
+			tableName, whereClause, idColumn, lastMaxID, idColumn, maxID)
+	} else {
+		copySQL = fmt.Sprintf("COPY (SELECT * FROM %s WHERE %s >= %d AND %s < %d) TO STDOUT (FORMAT binary)",
+			tableName, idColumn, lastMaxID, idColumn, maxID)
+	}
 
 	if !quiet {
 		fmt.Printf("SQL: %s\n", copySQL)

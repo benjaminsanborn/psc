@@ -19,10 +19,12 @@ func main() {
 	source := flag.String("source", "", "Source service name from pg_service.conf")
 	target := flag.String("target", "", "Target service name from pg_service.conf")
 	table := flag.String("table", "", "Table name to copy")
+	whereClause := flag.String("where", "", "Optional WHERE clause to filter rows (e.g., 'status = active')")
 	primaryKey := flag.String("primary-key", "id", "Primary key column for chunking (defaults to 'id')")
 	lastID := flag.Int64("last-id", 0, "Resume copy from this ID (optional, defaults to 0)")
 	chunkSize := flag.Int64("chunk-size", 1000, "Number of rows per batch (defaults to 1000)")
 	parallelism := flag.Int("parallelism", 1, "Number of concurrent workers (defaults to 1)")
+	targetSetup := flag.String("target-setup", "", "Optional SQL statements to execute on target before copy (semicolon-separated)")
 
 	flag.Parse()
 
@@ -57,11 +59,19 @@ func main() {
 
 	// Copy table
 	if *lastID > 0 {
-		fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d (chunk size: %d, workers: %d)...\n", *table, *source, *target, *lastID, *chunkSize, *parallelism)
+		if *whereClause != "" {
+			fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d (WHERE: %s, chunk size: %d, workers: %d)...\n", *table, *source, *target, *lastID, *whereClause, *chunkSize, *parallelism)
+		} else {
+			fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d (chunk size: %d, workers: %d)...\n", *table, *source, *target, *lastID, *chunkSize, *parallelism)
+		}
 	} else {
-		fmt.Printf("Copying table '%s' from '%s' to '%s' (chunk size: %d, workers: %d)...\n", *table, *source, *target, *chunkSize, *parallelism)
+		if *whereClause != "" {
+			fmt.Printf("Copying table '%s' from '%s' to '%s' (WHERE: %s, chunk size: %d, workers: %d)...\n", *table, *source, *target, *whereClause, *chunkSize, *parallelism)
+		} else {
+			fmt.Printf("Copying table '%s' from '%s' to '%s' (chunk size: %d, workers: %d)...\n", *table, *source, *target, *chunkSize, *parallelism)
+		}
 	}
-	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *primaryKey, *lastID, *chunkSize, *parallelism); err != nil {
+	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *whereClause, *primaryKey, *lastID, *chunkSize, *parallelism, *targetSetup); err != nil {
 		log.Fatalf("Failed to copy table: %v", err)
 	}
 
