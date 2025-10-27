@@ -22,18 +22,36 @@ func LoadCopyState(filename string) (*CopyState, error) {
 	return &state, nil
 }
 
-// FindCopyStateFile finds a state file for the given parameters
+// FindCopyStateFile finds a state file for the given parameters in ~/.psc/in_progress/
 func FindCopyStateFile(sourceName, targetName, tableName string) string {
-	filename := fmt.Sprintf("%s_%s_%s.pscstate", sourceName, targetName, tableName)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	filename := fmt.Sprintf("%s/.psc/in_progress/%s_%s_%s.pscstate", home, sourceName, targetName, tableName)
 	if _, err := os.Stat(filename); err == nil {
 		return filename
 	}
 	return ""
 }
 
-// FindAllCopyStateFiles finds all copy state files in the current directory
+// FindAllCopyStateFiles finds all copy state files in ~/.psc/in_progress/
 func FindAllCopyStateFiles() ([]string, error) {
-	files, err := filepath.Glob("*.pscstate")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	inProgressDir := fmt.Sprintf("%s/.psc/in_progress", home)
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(inProgressDir, 0755); err != nil {
+		return nil, err
+	}
+
+	pattern := fmt.Sprintf("%s/*.pscstate", inProgressDir)
+	files, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
 	}

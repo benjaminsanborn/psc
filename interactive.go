@@ -30,37 +30,39 @@ const (
 )
 
 type model struct {
-	screen            screen
-	services          map[string]ServiceConfig
-	serviceNames      []string
-	source            string
-	target            string
-	table             string
-	tables            []string
-	primaryKey        string
-	lastID            string
-	chunkSize         string
-	chunkSizeEdited   bool
-	parallelism       string
-	parallelismEdited bool
-	cursor            int
-	viewportTop       int
-	viewportSize      int
-	err               error
-	result            string
-	configPath        string
-	resumeFiles       []string
-	resumeStates      []*CopyState
-	progressMsg       string
-	totalRows         int64
-	copiedRows        int64
-	currentLastID     int64
-	progressPct       float64
-	copyInProgress    bool
-	progressChan      chan CopyProgress
-	cancelCopy        context.CancelFunc
-	filterText        string
-	filteredItems     []string
+	screen              screen
+	services            map[string]ServiceConfig
+	serviceNames        []string
+	source              string
+	target              string
+	table               string
+	tables              []string
+	primaryKey          string
+	lastID              string
+	chunkSize           string
+	chunkSizeEdited     bool
+	parallelism         string
+	parallelismEdited   bool
+	cursor              int
+	viewportTop         int
+	viewportSize        int
+	err                 error
+	result              string
+	configPath          string
+	resumeFiles         []string
+	resumeStates        []*CopyState
+	progressMsg         string
+	totalRows           int64
+	copiedRows          int64
+	currentLastID       int64
+	progressPct         float64
+	timeRemaining       string
+	estimatedCompletion string
+	copyInProgress      bool
+	progressChan        chan CopyProgress
+	cancelCopy          context.CancelFunc
+	filterText          string
+	filteredItems       []string
 }
 
 var (
@@ -459,6 +461,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.copiedRows = msg.copiedRows
 		m.currentLastID = msg.lastID
 		m.progressPct = msg.percentage
+		m.timeRemaining = msg.timeRemaining
+		m.estimatedCompletion = msg.completion
 		// Keep listening for more progress updates
 		return m, waitForProgress(m.progressChan)
 
@@ -817,8 +821,15 @@ func (m model) View() string {
 			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
 			s.WriteString("\n\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Last ID: %d", m.currentLastID)))
-			s.WriteString("\n\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows:  %s", formatNumber(m.totalRows))))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Next ID:         %s", formatNumber(m.currentLastID))))
+			s.WriteString("\n")
+			if m.timeRemaining != "" {
+				s.WriteString(normalStyle.Render(fmt.Sprintf("Time Left:       %s", m.timeRemaining)))
+				s.WriteString("\n")
+			}
+			s.WriteString("\n")
 		}
 
 		s.WriteString(promptStyle.Render(m.progressMsg))
@@ -827,15 +838,36 @@ func (m model) View() string {
 
 	case screenDone:
 		if m.err != nil {
-			s.WriteString(errorStyle.Render("Copy Failed"))
-			s.WriteString("\n\n")
 			s.WriteString(errorStyle.Render(m.err.Error()))
 		} else {
-			s.WriteString(successStyle.Render("Copy Completed Successfully!"))
-			s.WriteString("\n\n")
 			s.WriteString(normalStyle.Render(m.result))
 		}
-		s.WriteString("\n\n")
+
+		// Show final statistics
+		if m.totalRows > 0 {
+			s.WriteString("\n\n")
+			s.WriteString(normalStyle.Render("Final Statistics:"))
+			s.WriteString("\n")
+
+			// Progress bar
+			barWidth := 50
+			filled := int(float64(barWidth) * m.progressPct / 100.0)
+			if filled > barWidth {
+				filled = barWidth
+			}
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
+			s.WriteString("\n\n")
+
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows: %s", formatNumber(m.totalRows))))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Copied Rows:    %s", formatNumber(m.copiedRows))))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Last Copied ID: %s", formatNumber(m.currentLastID-1))))
+			s.WriteString("\n")
+		}
+
+		s.WriteString("\n")
 		s.WriteString(normalStyle.Render("Press esc to quit"))
 	}
 
@@ -850,11 +882,13 @@ func (m model) View() string {
 type copyResultMsg string
 type copyErrorMsg error
 type copyProgressMsg struct {
-	message    string
-	totalRows  int64
-	copiedRows int64
-	lastID     int64
-	percentage float64
+	message       string
+	totalRows     int64
+	copiedRows    int64
+	lastID        int64
+	percentage    float64
+	timeRemaining string
+	completion    string
 }
 
 func (m *model) performCopy() tea.Cmd {
@@ -919,11 +953,13 @@ func waitForProgress(progressChan chan CopyProgress) tea.Cmd {
 		}
 
 		return copyProgressMsg{
-			message:    progress.Message,
-			totalRows:  progress.TotalRows,
-			copiedRows: progress.CopiedRows,
-			lastID:     progress.LastID,
-			percentage: progress.Percentage,
+			message:       progress.Message,
+			totalRows:     progress.TotalRows,
+			copiedRows:    progress.CopiedRows,
+			lastID:        progress.LastID,
+			percentage:    progress.Percentage,
+			timeRemaining: progress.EstimatedTimeRemaining,
+			completion:    progress.EstimatedCompletion,
 		}
 	}
 }

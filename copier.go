@@ -30,13 +30,15 @@ type CopyState struct {
 
 // CopyProgress holds progress information for a copy operation
 type CopyProgress struct {
-	Message    string
-	TotalRows  int64
-	CopiedRows int64
-	LastID     int64
-	Percentage float64
-	Done       bool
-	Error      error
+	Message                string
+	TotalRows              int64
+	CopiedRows             int64
+	LastID                 int64
+	Percentage             float64
+	Done                   bool
+	Error                  error
+	EstimatedTimeRemaining string
+	EstimatedCompletion    string
 }
 
 // CopyTableWithProgress copies a table with progress updates sent to a channel
@@ -97,8 +99,18 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 		return fmt.Errorf("table '%s' does not exist on target database", tableName)
 	}
 
-	// Initialize copy state file
-	stateFile := fmt.Sprintf("%s_%s_%s.pscstate", sourceName, targetName, tableName)
+	// Initialize copy state file in ~/.psc/in_progress/
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	inProgressDir := fmt.Sprintf("%s/.psc/in_progress", home)
+	if err := os.MkdirAll(inProgressDir, 0755); err != nil {
+		return fmt.Errorf("failed to create in_progress directory: %w", err)
+	}
+
+	stateFile := fmt.Sprintf("%s/%s_%s_%s.pscstate", inProgressDir, sourceName, targetName, tableName)
 	state := CopyState{
 		SourceService: sourceName,
 		TargetService: targetName,
@@ -138,14 +150,31 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	copyStartTime := time.Now()
+
 	sendProgress := func(msg string, totalRows, copiedRows, lastID int64, percentage float64) {
+		var timeRemaining, completionTime string
+
+		if copiedRows > 0 && totalRows > 0 {
+			elapsed := time.Since(copyStartTime).Seconds()
+			rate := float64(copiedRows) / elapsed // rows per second
+			if rate > 0 {
+				remaining := totalRows - copiedRows
+				secondsRemaining := float64(remaining) / rate
+				timeRemaining = formatDuration(time.Duration(secondsRemaining * float64(time.Second)))
+				completionTime = time.Now().Add(time.Duration(secondsRemaining * float64(time.Second))).Format("15:04:05")
+			}
+		}
+
 		if progressChan != nil {
 			progressChan <- CopyProgress{
-				Message:    msg,
-				TotalRows:  totalRows,
-				CopiedRows: copiedRows,
-				LastID:     lastID,
-				Percentage: percentage,
+				Message:                msg,
+				TotalRows:              totalRows,
+				CopiedRows:             copiedRows,
+				LastID:                 lastID,
+				Percentage:             percentage,
+				EstimatedTimeRemaining: timeRemaining,
+				EstimatedCompletion:    completionTime,
 			}
 		}
 	}
@@ -338,6 +367,12 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		progressChan <- CopyProgress{Done: true}
 	}
 
+	// Move state file to completed directory
+	if err := moveStateFileToCompleted(stateFile); err != nil {
+		// Log warning but don't fail the operation
+		fmt.Printf("Warning: failed to move state file to completed: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -454,4 +489,46 @@ func connectWithSSLRetry(config ServiceConfig, dbName string, sendProgress func(
 	}
 
 	return db, nil
+}
+
+// formatDuration formats a duration into a human-readable string
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		minutes := int(d.Minutes())
+		seconds := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+// moveStateFileToCompleted moves a state file from in_progress to completed directory with timestamp
+func moveStateFileToCompleted(stateFile string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	completedDir := fmt.Sprintf("%s/.psc/completed", home)
+	if err := os.MkdirAll(completedDir, 0755); err != nil {
+		return err
+	}
+
+	// Extract filename from path and add timestamp
+	filename := stateFile[strings.LastIndex(stateFile, "/")+1:]
+	// Remove .pscstate extension, add timestamp, then add extension back
+	baseFilename := strings.TrimSuffix(filename, ".pscstate")
+	timestamp := time.Now().Format("20060102_150405")
+	destFile := fmt.Sprintf("%s/%s_%s.pscstate", completedDir, baseFilename, timestamp)
+
+	// Move the file
+	if err := os.Rename(stateFile, destFile); err != nil {
+		return err
+	}
+
+	return nil
 }
