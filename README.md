@@ -151,6 +151,32 @@ State files can be:
 - Manually deleted with 'x' key in TUI
 - Used to restart failed operations
 
+## Running on Remote Servers
+
+### Using tmux for Background Operations
+
+The recommended way to run long copies on remote servers is using `tmux` or `screen`:
+
+```bash
+# 1. SSH to remote server
+ssh user@server
+
+# 2. Start a tmux session
+tmux new -s psc-copy
+
+# 3. Run your copy in interactive mode
+psc
+
+# 4. Close the terminal
+
+# 5. Later, reconnect to check progress
+ssh user@server
+tmux attach -t psc-copy
+
+# 6. When done, exit tmux
+exit  # or Ctrl+D
+```
+
 ## Performance Tips
 
 - **Parallelism**: Start with 2-4 workers, test higher values based on your database capacity

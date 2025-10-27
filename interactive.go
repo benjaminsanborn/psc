@@ -65,6 +65,8 @@ type model struct {
 	copyInProgress      bool
 	progressChan        chan CopyProgress
 	cancelCopy          context.CancelFunc
+	cancelling          bool
+	confirmCancel       bool
 	filterText          string
 	filteredItems       []string
 	confirmDelete       bool
@@ -176,10 +178,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "esc":
-			// If copying, cancel the operation
+			// If copying, handle cancellation with confirmation
 			if m.screen == screenCopying && m.copyInProgress && m.cancelCopy != nil {
-				m.progressMsg = "Cancelling... waiting for workers to finish"
-				m.cancelCopy()
+				if !m.cancelling {
+					if m.confirmCancel {
+						// Second ESC - actually cancel
+						m.progressMsg = "⏳ Cancelling... waiting for workers to finish safely"
+						m.cancelling = true
+						m.confirmCancel = false
+						m.cancelCopy()
+						return m, nil
+					} else {
+						// First ESC - ask for confirmation
+						m.confirmCancel = true
+						return m, nil
+					}
+				}
+				// If already cancelling, ignore ESC
 				return m, nil
 			}
 			// Otherwise treat as quit
@@ -188,6 +203,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			m.confirmDelete = false
 			m.deleteIndex = -1
+			m.confirmCancel = false
 			if m.cursor > 0 {
 				m.cursor--
 				// Adjust viewport if cursor moves above visible area
@@ -199,6 +215,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			m.confirmDelete = false
 			m.deleteIndex = -1
+			m.confirmCancel = false
 			var maxItems int
 			switch m.screen {
 			case screenResume:
@@ -228,6 +245,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "x":
+			m.confirmCancel = false
 			// Delete state file on resume screen
 			if m.screen == screenResume && m.cursor < len(m.resumeFiles) {
 				if m.confirmDelete && m.deleteIndex == m.cursor {
@@ -267,6 +285,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
+			m.confirmCancel = false
 			switch m.screen {
 			case screenResume:
 				m.confirmDelete = false
@@ -382,6 +401,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "\\":
+			m.confirmCancel = false
 			// Go back to previous screen
 			switch m.screen {
 			case screenTarget:
@@ -986,7 +1006,15 @@ func (m model) View() string {
 
 		s.WriteString(promptStyle.Render(m.progressMsg))
 		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render("Press esc to cancel (copy will resume from last checkpoint)"))
+
+		// Show appropriate message based on state
+		if m.cancelling {
+			s.WriteString(errorStyle.Render("⏳ Cancelling... please wait for workers to finish safely"))
+		} else if m.confirmCancel {
+			s.WriteString(errorStyle.Render("⚠️  Press ESC again to confirm cancellation"))
+		} else {
+			s.WriteString(normalStyle.Render("Press ESC to cancel (copy will resume from last checkpoint)"))
+		}
 
 	case screenDone:
 		if m.err != nil {
