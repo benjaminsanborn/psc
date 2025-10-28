@@ -114,12 +114,6 @@ Copy only specific rows with a WHERE clause:
 psc -source prod_db -target dev_db -table users -where "status = 'active' AND created_at > '2024-01-01'"
 ```
 
-Optimize target for bulk loading with session setup:
-```bash
-psc -source prod_db -target dev_db -table big_table -parallelism 4 \
-  -target-setup "SET synchronous_commit TO off; SET maintenance_work_mem TO '2GB'"
-```
-
 ## How It Works
 
 1. **Connects** to source and target databases using pg_service.conf configurations
@@ -183,18 +177,6 @@ exit  # or Ctrl+D
 - **Chunk size**: Larger chunks (5000-10000) are faster but use more memory
 - **Network**: Works best on low-latency connections between databases
 - **Indexes**: Consider temporarily dropping indexes on target table for faster inserts
-- **Target setup**: Use session parameters to optimize bulk loading (see below)
-
-### Target Session Optimization
-
-The interactive mode provides a "Target Session Setup" screen with recommended PostgreSQL settings for bulk loading:
-
-```sql
-SET synchronous_commit TO off;           -- Skip waiting for WAL sync
-SET maintenance_work_mem TO '2GB';       -- More memory for operations
-```
-
-These settings are executed on the target session before copying begins. **If any statement fails, the copy operation will abort with an error message.**
 
 ## Requirements
 
