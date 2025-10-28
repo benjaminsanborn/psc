@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/benjaminsanborn/psc/compare/v1.2.0...v1.2.1) (2025-10-28)
+
+
+### Bug Fixes
+
+* remove unnecessary setup window ([a179681](https://github.com/benjaminsanborn/psc/commit/a1796810afeaf0c92549aa49bbbc2f719f108f16))
+
 # [1.2.0](https://github.com/benjaminsanborn/psc/compare/v1.1.0...v1.2.0) (2025-10-27)
 
 
