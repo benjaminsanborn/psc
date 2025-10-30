@@ -96,8 +96,41 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 	if err := targetDB.QueryRow(checkSQL, tableName).Scan(&exists); err != nil {
 		return fmt.Errorf("failed to check if table exists: %w", err)
 	}
+
 	if !exists {
-		return fmt.Errorf("table '%s' does not exist on target database", tableName)
+		sendProgress(fmt.Sprintf("Target table '%s' does not exist, creating from source schema...", tableName), 0, 0, 0, 0)
+
+		// Get the CREATE TABLE statement from source using pg_dump
+		dumpCmd := exec.Command("pg_dump",
+			fmt.Sprintf("service=%s", sourceName),
+			"-t", tableName,
+			"--schema-only",
+			"--no-owner",
+			"--no-privileges")
+
+		dumpOutput, err := dumpCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to dump table schema: %w\nOutput: %s", err, string(dumpOutput))
+		}
+
+		// Execute the DDL on target using psql to handle multi-line statements properly
+		// This is safer than trying to parse SQL ourselves
+		execCmd := exec.Command("psql", fmt.Sprintf("service=%s", targetName), "-f", "-", "-q") // -q for quiet mode
+		execCmd.Stdin = strings.NewReader(string(dumpOutput))
+		execOutput, err := execCmd.CombinedOutput()
+
+		// Check if table was created successfully (even if some statements like indexes failed)
+		var tableNowExists bool
+		if err := targetDB.QueryRow(checkSQL, tableName).Scan(&tableNowExists); err != nil {
+			return fmt.Errorf("failed to verify table creation: %w", err)
+		}
+
+		if !tableNowExists {
+			// psql execution may have failed - return error with output for debugging
+			return fmt.Errorf("failed to create table '%s' on target database\npsql output: %s", tableName, string(execOutput))
+		}
+
+		sendProgress(fmt.Sprintf("Table '%s' created successfully on target", tableName), 0, 0, 0, 0)
 	}
 
 	// Initialize copy state file in ~/.psc/in_progress/
