@@ -76,6 +76,17 @@ type model struct {
 	filteredItems       []string
 	confirmDelete       bool
 	deleteIndex         int
+	tableProgress       map[string]tableProgressInfo // Progress per table
+}
+
+// tableProgressInfo holds progress information for a single table
+type tableProgressInfo struct {
+	tableName     string
+	maxID         int64
+	currentLastID int64
+	percentage    float64
+	message       string
+	timeRemaining string
 }
 
 var (
@@ -152,6 +163,7 @@ func runInteractive() error {
 		viewportSize:   10, // Show 10 items at a time
 		resumeFiles:    resumeFiles,
 		resumeStates:   resumeStates,
+		tableProgress:  make(map[string]tableProgressInfo),
 	}
 
 	p := tea.NewProgram(m)
@@ -323,16 +335,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					state := m.resumeStates[m.cursor]
 					m.source = state.SourceService
 					m.target = state.TargetService
-					m.table = state.TableName
-					m.selectedTables = map[string]bool{state.TableName: true}
 
-					// Initialize per-table config from resume state
-					m.tablesToConfigure = []string{state.TableName}
+					// Handle multiple tables in state
+					selectedTables := make(map[string]bool)
+					m.tablesToConfigure = []string{}
 					m.tableConfigs = make(map[string]*tableConfig)
-					m.tableConfigs[state.TableName] = &tableConfig{
-						whereClause: state.WhereClause,
-						primaryKey:  state.PrimaryKey,
-						lastID:      fmt.Sprintf("%d", state.LastID),
+
+					for _, tableState := range state.Tables {
+						selectedTables[tableState.TableName] = true
+						m.tablesToConfigure = append(m.tablesToConfigure, tableState.TableName)
+						m.tableConfigs[tableState.TableName] = &tableConfig{
+							whereClause: tableState.WhereClause,
+							primaryKey:  tableState.PrimaryKey,
+							lastID:      fmt.Sprintf("%d", tableState.LastID),
+						}
+					}
+
+					// For backward compatibility: if no tables, try old format
+					if len(state.Tables) == 0 {
+						// This shouldn't happen with migration, but handle gracefully
+						m.screen = screenSource
+						m.cursor = 0
+						m.viewportTop = 0
+						return m, nil
+					}
+
+					m.selectedTables = selectedTables
+					// Set m.table to first table for backward compatibility
+					if len(m.tablesToConfigure) > 0 {
+						m.table = m.tablesToConfigure[0]
 					}
 
 					if state.ChunkSize > 0 {
@@ -437,10 +468,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.totalRows = 0
 				m.progressPct = 0
 				m.progressChan = make(chan CopyProgress, 100)
+				m.tableProgress = make(map[string]tableProgressInfo) // Reset table progress
 				return m, m.performCopy()
 
-			case screenDone:
-				return m, tea.Quit
+				// screenDone is no longer used - we stay on screenCopying after completion
 			}
 
 		case "\\":
@@ -630,21 +661,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progressPct = msg.percentage
 		m.timeRemaining = msg.timeRemaining
 		m.estimatedCompletion = msg.completion
+
+		// Update per-table progress
+		if msg.tableName != "" {
+			if _, exists := m.tableProgress[msg.tableName]; !exists {
+				m.tableProgress[msg.tableName] = tableProgressInfo{tableName: msg.tableName}
+			}
+			progress := m.tableProgress[msg.tableName]
+			progress.maxID = msg.totalRows
+			progress.currentLastID = msg.lastID
+			progress.percentage = msg.percentage
+			progress.message = msg.message
+			progress.timeRemaining = msg.timeRemaining
+			m.tableProgress[msg.tableName] = progress
+		}
+
 		// Keep listening for more progress updates
 		return m, waitForProgress(m.progressChan)
 
 	case copyResultMsg:
 		m.result = string(msg)
+		m.progressMsg = string(msg)
 		m.copyInProgress = false
 		m.cancelCopy = nil
-		m.screen = screenDone
+		// Stay on screenCopying to show completion message
 		return m, nil
 
 	case copyErrorMsg:
 		m.err = error(msg)
+		m.progressMsg = fmt.Sprintf("Error: %v", error(msg))
 		m.copyInProgress = false
 		m.cancelCopy = nil
-		m.screen = screenDone
+		// Stay on screenCopying to show error message
 		return m, nil
 	}
 
@@ -733,8 +781,22 @@ func (m model) View() string {
 				if state.Parallelism > 1 {
 					parallelInfo = fmt.Sprintf(", workers: %d", state.Parallelism)
 				}
-				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
-					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo, parallelInfo)
+
+				// Display table info
+				var label string
+				if len(state.Tables) == 0 {
+					// Old format - shouldn't happen with migration but handle gracefully
+					label = fmt.Sprintf("📄 %s → %s: (no tables)", state.SourceService, state.TargetService)
+				} else if len(state.Tables) == 1 {
+					// Single table
+					tableState := state.Tables[0]
+					label = fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
+						state.SourceService, state.TargetService, tableState.TableName, tableState.LastID, chunkInfo, parallelInfo)
+				} else {
+					// Multiple tables
+					label = fmt.Sprintf("📄 %s → %s: %d tables%s%s",
+						state.SourceService, state.TargetService, len(state.Tables), chunkInfo, parallelInfo)
+				}
 
 				if m.confirmDelete && m.deleteIndex == i {
 					// Show delete confirmation
@@ -1057,87 +1119,142 @@ func (m model) View() string {
 		s.WriteString(promptStyle.Render("Press Enter to start copy, \\ to go back"))
 
 	case screenCopying:
-		s.WriteString(titleStyle.Render("Copying Data"))
-		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		// Title with progress message on the same line, right-aligned
+		titleText := titleStyle.Render("Copying Data")
+		s.WriteString(titleText)
 		s.WriteString("\n")
-		selectedTables := m.getSelectedTablesList()
-		if len(selectedTables) == 1 {
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", selectedTables[0])))
-		} else {
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Tables: %d tables selected", len(selectedTables))))
-		}
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render(m.progressMsg))
 		s.WriteString("\n\n")
 
-		if m.totalRows > 0 {
-			// Progress bar
-			barWidth := 50
-			filled := int(float64(barWidth) * m.progressPct / 100.0)
-			if filled > barWidth {
-				filled = barWidth
+		selectedTables := m.getSelectedTablesList()
+
+		// Show progress bars for each table
+		if len(selectedTables) > 1 {
+			// Multiple tables - show progress bar for each in table format
+			// Find max table name length and max ID string length for alignment
+			maxNameLen := 0
+			maxIDStrLen := 0
+			for _, tableName := range selectedTables {
+				if len(tableName) > maxNameLen {
+					maxNameLen = len(tableName)
+				}
+				if progress, exists := m.tableProgress[tableName]; exists && progress.maxID > 0 {
+					idStr := fmt.Sprintf("%s/%s", formatNumber(progress.currentLastID), formatNumber(progress.maxID))
+					if len(idStr) > maxIDStrLen {
+						maxIDStrLen = len(idStr)
+					}
+				}
 			}
-			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
-			s.WriteString("\n\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows:  %s", formatNumber(m.totalRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Next ID:         %s", formatNumber(m.currentLastID))))
-			s.WriteString("\n")
-			if m.timeRemaining != "" {
-				s.WriteString(normalStyle.Render(fmt.Sprintf("Time Left:       %s", m.timeRemaining)))
+			if maxNameLen < 8 {
+				maxNameLen = 8 // minimum width
+			}
+
+			barWidth := 40
+
+			// Format each table row with aligned columns
+			for _, tableName := range selectedTables {
+				progress, exists := m.tableProgress[tableName]
+				if !exists {
+					// Table hasn't started yet - show pending
+					namePadded := fmt.Sprintf("%-*s", maxNameLen, tableName)
+					s.WriteString(normalStyle.Render(fmt.Sprintf("⏳ %s  Waiting...", namePadded)))
+					s.WriteString("\n")
+					continue
+				}
+
+				// Progress bar for this table
+				filled := int(float64(barWidth) * progress.percentage / 100.0)
+				if filled > barWidth {
+					filled = barWidth
+				}
+				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+				// Status icon
+				status := "🔄"
+				if progress.percentage >= 100 {
+					status = "✅"
+				}
+
+				// Format as table: Status | Name | Bar | Percentage | IDs | ETA
+				namePadded := fmt.Sprintf("%-*s", maxNameLen, tableName)
+				percentageStr := fmt.Sprintf("%5.1f%%", progress.percentage)
+
+				// Build the row with aligned columns
+				row := fmt.Sprintf("%s %s  [%s]  %s", status, namePadded, bar, percentageStr)
+
+				// Add ID counts if available (left-aligned for consistent column alignment)
+				if progress.maxID > 0 {
+					idStr := fmt.Sprintf("%s/%s", formatNumber(progress.currentLastID), formatNumber(progress.maxID))
+					if maxIDStrLen > 0 {
+						row += fmt.Sprintf("  %-*s", maxIDStrLen, idStr)
+					} else {
+						row += fmt.Sprintf("  %s", idStr)
+					}
+
+					// Add ETA if available
+					if progress.timeRemaining != "" {
+						row += fmt.Sprintf("  ETA: %s", progress.timeRemaining)
+					}
+				}
+
+				s.WriteString(row)
 				s.WriteString("\n")
 			}
+		} else if len(selectedTables) == 1 {
+			// Single table - show detailed progress
+			tableName := selectedTables[0]
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", tableName)))
+			s.WriteString("\n\n")
+
+			if m.totalRows > 0 {
+				// Progress bar
+				barWidth := 50
+				filled := int(float64(barWidth) * m.progressPct / 100.0)
+				if filled > barWidth {
+					filled = barWidth
+				}
+				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+				s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
+				s.WriteString("\n\n")
+				s.WriteString(normalStyle.Render(fmt.Sprintf("Max ID:         %s", formatNumber(m.totalRows))))
+				s.WriteString("\n")
+				s.WriteString(normalStyle.Render(fmt.Sprintf("Next ID:         %s", formatNumber(m.currentLastID))))
+				s.WriteString("\n")
+				if m.timeRemaining != "" {
+					s.WriteString(normalStyle.Render(fmt.Sprintf("Time Left:       %s", m.timeRemaining)))
+					s.WriteString("\n")
+				}
+				s.WriteString("\n")
+			}
+
+			// Progress message is now shown in header, don't duplicate here
 			s.WriteString("\n")
 		}
 
-		s.WriteString(promptStyle.Render(m.progressMsg))
-		s.WriteString("\n\n")
-
 		// Show appropriate message based on state
-		if m.cancelling {
+		if !m.copyInProgress {
+			// Copy completed or errored
+			if m.err != nil {
+				s.WriteString("\n")
+				s.WriteString(errorStyle.Render(m.progressMsg))
+			} else {
+				s.WriteString("\n")
+				s.WriteString(successStyle.Render(m.progressMsg))
+			}
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render("Press esc to quit"))
+		} else if m.cancelling {
 			s.WriteString(errorStyle.Render("⏳ Cancelling... please wait for workers to finish safely"))
 		} else if m.confirmCancel {
 			s.WriteString(errorStyle.Render("⚠️  Press ESC again to confirm cancellation"))
 		} else {
 			s.WriteString(normalStyle.Render("Press ESC to cancel (copy will resume from last checkpoint)"))
 		}
-
-	case screenDone:
-		if m.err != nil {
-			s.WriteString(errorStyle.Render(m.err.Error()))
-		} else {
-			s.WriteString(normalStyle.Render(m.result))
-		}
-
-		// Show final statistics
-		if m.totalRows > 0 {
-			s.WriteString("\n\n")
-			s.WriteString(normalStyle.Render("Final Statistics:"))
-			s.WriteString("\n")
-
-			// Progress bar
-			barWidth := 50
-			filled := int(float64(barWidth) * m.progressPct / 100.0)
-			if filled > barWidth {
-				filled = barWidth
-			}
-			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
-			s.WriteString("\n\n")
-
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows: %s", formatNumber(m.totalRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Copied Rows:    %s", formatNumber(m.copiedRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Last Copied ID: %s", formatNumber(m.currentLastID-1))))
-			s.WriteString("\n")
-		}
-
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render("Press esc to quit"))
 	}
 
-	if m.screen != screenDone && m.screen != screenCopying {
+	if m.screen != screenCopying {
 		s.WriteString("\n\n")
 		if m.screen == screenTable {
 			s.WriteString(normalStyle.Render("↑/↓: navigate • Space: toggle • Enter: continue • \\: go back • esc: quit"))
@@ -1152,6 +1269,7 @@ func (m model) View() string {
 type copyResultMsg string
 type copyErrorMsg error
 type copyProgressMsg struct {
+	tableName     string
 	message       string
 	totalRows     int64
 	copiedRows    int64
@@ -1188,6 +1306,42 @@ func (m *model) performCopy() tea.Cmd {
 	// Get selected tables in sorted order
 	selectedTables := m.getSelectedTablesList()
 
+	// Initialize state file with all tables before starting any copy operations
+	tableInfos := make([]struct {
+		Name        string
+		WhereClause string
+		PrimaryKey  string
+		LastID      int64
+	}, 0, len(selectedTables))
+
+	for _, tableName := range selectedTables {
+		cfg := m.tableConfigs[tableName]
+		var lastID int64 = 0
+		if cfg.lastID != "" {
+			if parsed, err := strconv.ParseInt(cfg.lastID, 10, 64); err == nil {
+				lastID = parsed
+			}
+		}
+		tableInfos = append(tableInfos, struct {
+			Name        string
+			WhereClause string
+			PrimaryKey  string
+			LastID      int64
+		}{
+			Name:        tableName,
+			WhereClause: cfg.whereClause,
+			PrimaryKey:  cfg.primaryKey,
+			LastID:      lastID,
+		})
+	}
+
+	stateFile, err := InitializeMultiTableState(m.source, m.target, tableInfos, chunkSize, parallelism)
+	if err != nil {
+		m.progressChan <- CopyProgress{Error: fmt.Errorf("failed to initialize state file: %w", err)}
+		close(m.progressChan)
+		return waitForProgress(m.progressChan)
+	}
+
 	// Start copy in goroutine
 	go func() {
 		for i, tableName := range selectedTables {
@@ -1204,7 +1358,7 @@ func (m *model) performCopy() tea.Cmd {
 
 			// Send message indicating which table we're copying
 			progressMsg := fmt.Sprintf("Copying table %d of %d: %s", i+1, len(selectedTables), tableName)
-			m.progressChan <- CopyProgress{Message: progressMsg}
+			m.progressChan <- CopyProgress{TableName: tableName, Message: progressMsg}
 
 			err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, tableName, cfg.whereClause, cfg.primaryKey, lastID, chunkSize, parallelism, m.progressChan)
 			if err != nil {
@@ -1223,7 +1377,11 @@ func (m *model) performCopy() tea.Cmd {
 			}
 		}
 
-		// All tables copied successfully
+		// All tables copied successfully - move state file to completed
+		if err := moveStateFileToCompleted(stateFile); err != nil {
+			// Log warning but don't fail
+			m.progressChan <- CopyProgress{Message: fmt.Sprintf("Warning: failed to move state file to completed: %v", err)}
+		}
 		m.progressChan <- CopyProgress{Done: true, Message: fmt.Sprintf("Successfully copied %d table(s)", len(selectedTables))}
 		close(m.progressChan)
 	}()
@@ -1244,6 +1402,8 @@ func waitForProgress(progressChan chan CopyProgress) tea.Cmd {
 			return copyErrorMsg(progress.Error)
 		}
 
+		// Only treat Done: true as completion (but CopyTableWithProgress no longer sends this)
+		// Instead, completion is handled by the goroutine closing the channel after all tables
 		if progress.Done {
 			if progress.Message != "" {
 				return copyResultMsg(progress.Message)
@@ -1252,6 +1412,7 @@ func waitForProgress(progressChan chan CopyProgress) tea.Cmd {
 		}
 
 		return copyProgressMsg{
+			tableName:     progress.TableName,
 			message:       progress.Message,
 			totalRows:     progress.TotalRows,
 			copiedRows:    progress.CopiedRows,
