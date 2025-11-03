@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/benjaminsanborn/psc/compare/v1.2.1...v1.3.0) (2025-11-03)
+
+
+### Features
+
+* support multiple table copy ([79af637](https://github.com/benjaminsanborn/psc/commit/79af63779a1f3c9a021111c3ca2f67f224ee2eaa))
+
 ## [1.2.1](https://github.com/benjaminsanborn/psc/compare/v1.2.0...v1.2.1) (2025-10-28)
 
 
