@@ -14,23 +14,109 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// TableState holds the state for a single table in a copy operation
+type TableState struct {
+	TableName   string   `json:"table_name"`
+	WhereClause string   `json:"where_clause,omitempty"`
+	PrimaryKey  string   `json:"primary_key"`
+	LastID      int64    `json:"last_id"`          // Highest successfully completed ID
+	Errors      []string `json:"errors,omitempty"` // Any errors encountered for this table
+}
+
 // CopyState holds the state of an ongoing copy operation
 type CopyState struct {
-	SourceService string   `json:"source_service"`
-	TargetService string   `json:"target_service"`
-	TableName     string   `json:"table_name"`
-	WhereClause   string   `json:"where_clause,omitempty"`
-	PrimaryKey    string   `json:"primary_key"`
-	ChunkSize     int64    `json:"chunk_size"`
-	Parallelism   int      `json:"parallelism"`
-	LastID        int64    `json:"last_id"` // Highest successfully completed ID
-	StartTime     string   `json:"start_time"`
-	LastUpdate    string   `json:"last_update"`
-	Errors        []string `json:"errors,omitempty"` // Any errors encountered
+	SourceService string       `json:"source_service"`
+	TargetService string       `json:"target_service"`
+	ChunkSize     int64        `json:"chunk_size"`
+	Parallelism   int          `json:"parallelism"`
+	StartTime     string       `json:"start_time"`
+	LastUpdate    string       `json:"last_update"`
+	Tables        []TableState `json:"tables"`
+}
+
+// GetTableState returns the TableState for the given table name, or nil if not found
+func (cs *CopyState) GetTableState(tableName string) *TableState {
+	for i := range cs.Tables {
+		if cs.Tables[i].TableName == tableName {
+			return &cs.Tables[i]
+		}
+	}
+	return nil
+}
+
+// AddOrUpdateTableState adds or updates the state for a table
+func (cs *CopyState) AddOrUpdateTableState(table TableState) {
+	for i := range cs.Tables {
+		if cs.Tables[i].TableName == table.TableName {
+			cs.Tables[i] = table
+			return
+		}
+	}
+	cs.Tables = append(cs.Tables, table)
+}
+
+// InitializeMultiTableState initializes the state file with all tables before copying starts
+func InitializeMultiTableState(sourceName, targetName string, tables []struct {
+	Name        string
+	WhereClause string
+	PrimaryKey  string
+	LastID      int64
+}, chunkSize int64, parallelism int) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	inProgressDir := fmt.Sprintf("%s/.psc/in_progress", home)
+	if err := os.MkdirAll(inProgressDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create in_progress directory: %w", err)
+	}
+
+	stateFile := fmt.Sprintf("%s/%s_%s.pscstate", inProgressDir, sourceName, targetName)
+
+	// Load existing state if it exists
+	state, err := LoadCopyState(stateFile)
+	if err != nil {
+		// Create new state with all tables
+		state = &CopyState{
+			SourceService: sourceName,
+			TargetService: targetName,
+			ChunkSize:     chunkSize,
+			Parallelism:   parallelism,
+			StartTime:     time.Now().Format(time.RFC3339),
+			LastUpdate:    time.Now().Format(time.RFC3339),
+			Tables:        []TableState{},
+		}
+	} else {
+		// Update common settings
+		state.ChunkSize = chunkSize
+		state.Parallelism = parallelism
+		state.LastUpdate = time.Now().Format(time.RFC3339)
+	}
+
+	// Add or update all tables
+	for _, t := range tables {
+		tableState := TableState{
+			TableName:   t.Name,
+			WhereClause: t.WhereClause,
+			PrimaryKey:  t.PrimaryKey,
+			LastID:      t.LastID,
+			Errors:      []string{},
+		}
+		state.AddOrUpdateTableState(tableState)
+	}
+
+	// Save state file
+	if err := saveCopyState(stateFile, state); err != nil {
+		return "", fmt.Errorf("failed to save state file: %w", err)
+	}
+
+	return stateFile, nil
 }
 
 // CopyProgress holds progress information for a copy operation
 type CopyProgress struct {
+	TableName              string // Table name this progress update is for
 	Message                string
 	TotalRows              int64
 	CopiedRows             int64
@@ -96,8 +182,41 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 	if err := targetDB.QueryRow(checkSQL, tableName).Scan(&exists); err != nil {
 		return fmt.Errorf("failed to check if table exists: %w", err)
 	}
+
 	if !exists {
-		return fmt.Errorf("table '%s' does not exist on target database", tableName)
+		sendProgress(fmt.Sprintf("Target table '%s' does not exist, creating from source schema...", tableName), 0, 0, 0, 0)
+
+		// Get the CREATE TABLE statement from source using pg_dump
+		dumpCmd := exec.Command("pg_dump",
+			fmt.Sprintf("service=%s", sourceName),
+			"-t", tableName,
+			"--schema-only",
+			"--no-owner",
+			"--no-privileges")
+
+		dumpOutput, err := dumpCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to dump table schema: %w\nOutput: %s", err, string(dumpOutput))
+		}
+
+		// Execute the DDL on target using psql to handle multi-line statements properly
+		// This is safer than trying to parse SQL ourselves
+		execCmd := exec.Command("psql", fmt.Sprintf("service=%s", targetName), "-f", "-", "-q") // -q for quiet mode
+		execCmd.Stdin = strings.NewReader(string(dumpOutput))
+		execOutput, err := execCmd.CombinedOutput()
+
+		// Check if table was created successfully (even if some statements like indexes failed)
+		var tableNowExists bool
+		if err := targetDB.QueryRow(checkSQL, tableName).Scan(&tableNowExists); err != nil {
+			return fmt.Errorf("failed to verify table creation: %w", err)
+		}
+
+		if !tableNowExists {
+			// psql execution may have failed - return error with output for debugging
+			return fmt.Errorf("failed to create table '%s' on target database\npsql output: %s", tableName, string(execOutput))
+		}
+
+		sendProgress(fmt.Sprintf("Table '%s' created successfully on target", tableName), 0, 0, 0, 0)
 	}
 
 	// Initialize copy state file in ~/.psc/in_progress/
@@ -111,30 +230,49 @@ func copyTableInternal(ctx context.Context, sourceName, targetName string, sourc
 		return fmt.Errorf("failed to create in_progress directory: %w", err)
 	}
 
-	stateFile := fmt.Sprintf("%s/%s_%s_%s.pscstate", inProgressDir, sourceName, targetName, tableName)
-	state := CopyState{
-		SourceService: sourceName,
-		TargetService: targetName,
-		TableName:     tableName,
-		WhereClause:   whereClause,
-		PrimaryKey:    primaryKey,
-		ChunkSize:     chunkSize,
-		Parallelism:   parallelism,
-		LastID:        lastID,
-		StartTime:     time.Now().Format(time.RFC3339),
-		LastUpdate:    time.Now().Format(time.RFC3339),
-		Errors:        []string{},
+	// Use a single state file per operation (source_target.pscstate)
+	stateFile := fmt.Sprintf("%s/%s_%s.pscstate", inProgressDir, sourceName, targetName)
+
+	// Load existing state - should already exist if called from interactive mode with multiple tables
+	// For single table mode (CLI), it may not exist yet
+	var state *CopyState
+	state, err = LoadCopyState(stateFile)
+	if err != nil {
+		// Create new state (for CLI single-table mode)
+		state = &CopyState{
+			SourceService: sourceName,
+			TargetService: targetName,
+			ChunkSize:     chunkSize,
+			Parallelism:   parallelism,
+			StartTime:     time.Now().Format(time.RFC3339),
+			LastUpdate:    time.Now().Format(time.RFC3339),
+			Tables:        []TableState{},
+		}
+	} else {
+		// Update common settings if they differ
+		state.ChunkSize = chunkSize
+		state.Parallelism = parallelism
+		state.LastUpdate = time.Now().Format(time.RFC3339)
 	}
 
-	if err := saveCopyState(stateFile, &state); err != nil {
-		sendProgress(fmt.Sprintf("Warning: failed to create state file: %v", err), 0, 0, 0, 0)
+	// Add or update table state (will update if already exists from InitializeMultiTableState)
+	tableState := TableState{
+		TableName:   tableName,
+		WhereClause: whereClause,
+		PrimaryKey:  primaryKey,
+		LastID:      lastID,
+		Errors:      []string{},
 	}
+	state.AddOrUpdateTableState(tableState)
 
-	sendProgress("Initializing state file...", 0, 0, 0, 0)
+	// Save state file to ensure it's up to date
+	if err := saveCopyState(stateFile, state); err != nil {
+		sendProgress(fmt.Sprintf("Warning: failed to update state file: %v", err), 0, 0, 0, 0)
+	}
 
 	// Copy data
 	sendProgress("Starting data copy...", 0, 0, 0, 0)
-	return copyData(ctx, sourceName, targetName, sourceDB, targetDB, tableName, whereClause, primaryKey, lastID, chunkSize, parallelism, stateFile, &state, progressChan)
+	return copyData(ctx, sourceName, targetName, sourceDB, targetDB, tableName, whereClause, primaryKey, lastID, chunkSize, parallelism, stateFile, state, progressChan)
 }
 
 // chunkResult holds the result of a chunk copy operation
@@ -154,14 +292,14 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 
 	copyStartTime := time.Now()
 
-	sendProgress := func(msg string, totalRows, copiedRows, lastID int64, percentage float64) {
+	sendProgress := func(msg string, maxIDParam, copiedRows, lastID int64, percentage float64) {
 		var timeRemaining, completionTime string
 
-		if copiedRows > 0 && totalRows > 0 {
+		if copiedRows > 0 && maxIDParam > startID {
 			elapsed := time.Since(copyStartTime).Seconds()
 			rate := float64(copiedRows) / elapsed // rows per second
 			if rate > 0 {
-				remaining := totalRows - copiedRows
+				remaining := maxIDParam - lastID
 				secondsRemaining := float64(remaining) / rate
 				timeRemaining = formatDuration(time.Duration(secondsRemaining * float64(time.Second)))
 				completionTime = time.Now().Add(time.Duration(secondsRemaining * float64(time.Second))).Format("15:04:05")
@@ -170,8 +308,9 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 
 		if progressChan != nil {
 			progressChan <- CopyProgress{
+				TableName:              tableName,
 				Message:                msg,
-				TotalRows:              totalRows,
+				TotalRows:              maxIDParam,
 				CopiedRows:             copiedRows,
 				LastID:                 lastID,
 				Percentage:             percentage,
@@ -180,19 +319,39 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 			}
 		}
 	}
-	sendProgress("Getting row count...", 0, 0, 0, 0)
+	sendProgress("Getting max ID...", 0, 0, 0, 0)
 
-	// Get estimated row count
-	var estimatedRows int64
-	countSQL := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE relname = '%s'", tableName)
-	if err := sourceDB.QueryRow(countSQL).Scan(&estimatedRows); err != nil {
-		// Fallback to COUNT(*) if estimate not available
-		countSQL = fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
-		if err := sourceDB.QueryRow(countSQL).Scan(&estimatedRows); err != nil {
-			return fmt.Errorf("failed to get row count: %w", err)
+	// Get MAX(id) from source table
+	var maxID int64
+	var maxSQL string
+	if whereClause != "" {
+		maxSQL = fmt.Sprintf("SELECT MAX(%s) FROM %s WHERE (%s)", idColumn, tableName, whereClause)
+	} else {
+		maxSQL = fmt.Sprintf("SELECT MAX(%s) FROM %s", idColumn, tableName)
+	}
+	if err := sourceDB.QueryRow(maxSQL).Scan(&maxID); err != nil {
+		// Handle NULL case (empty table)
+		if err == sql.ErrNoRows {
+			maxID = startID - 1 // No rows to copy
+		} else {
+			return fmt.Errorf("failed to get max ID: %w", err)
 		}
 	}
-	sendProgress(fmt.Sprintf("Found %d rows to copy", estimatedRows), estimatedRows, 0, startID, 0)
+	// Handle NULL result from MAX (empty table)
+	if maxID == 0 && whereClause == "" {
+		// Check if table has any rows
+		var count int64
+		countSQL := fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
+		if err := sourceDB.QueryRow(countSQL).Scan(&count); err == nil && count == 0 {
+			maxID = startID - 1 // Empty table
+		}
+	}
+
+	if maxID < startID {
+		maxID = startID - 1 // No rows to copy beyond startID
+	}
+
+	sendProgress(fmt.Sprintf("Max ID: %d (copying from ID %d to %d)", maxID, startID, maxID), maxID, 0, startID, 0)
 
 	// Get column names
 	query := `
@@ -221,7 +380,7 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		return fmt.Errorf("no columns found for table %s", tableName)
 	}
 
-	sendProgress(fmt.Sprintf("Using column '%s' for chunking with %d workers", idColumn, parallelism), estimatedRows, 0, startID, 0)
+	sendProgress(fmt.Sprintf("Using column '%s' for chunking with %d workers", idColumn, parallelism), maxID, 0, startID, 0)
 
 	// Determine if we should suppress output (interactive mode)
 	quiet := progressChan != nil
@@ -255,7 +414,7 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 
 				// Get next chunk to process
 				mu.Lock()
-				if nextStartID > estimatedRows+startID {
+				if nextStartID > maxID {
 					mu.Unlock()
 					return
 				}
@@ -300,14 +459,23 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 			mu.Lock()
 			errMsg := fmt.Sprintf("Error copying chunk starting at %d: \n%v", result.startID, result.err)
 			errors = append(errors, errMsg)
-			state.Errors = errors
+			// Update table-specific errors
+			tableState := state.GetTableState(tableName)
+			if tableState != nil {
+				tableState.Errors = append(tableState.Errors, errMsg)
+				state.AddOrUpdateTableState(*tableState)
+			}
 			mu.Unlock()
 
 			// Log error
 			if !quiet {
 				fmt.Printf("ERROR: %s\n", errMsg)
 			}
-			sendProgress(errMsg, estimatedRows, totalCopied, highestCompletedID, float64(totalCopied)/float64(estimatedRows)*100)
+			percentage := 0.0
+			if maxID > startID {
+				percentage = float64(highestCompletedID-startID) / float64(maxID-startID) * 100
+			}
+			sendProgress(errMsg, maxID, totalCopied, highestCompletedID, percentage)
 
 			// Cancel all workers on error
 			cancel()
@@ -326,21 +494,28 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 			highestCompletedID = result.endID
 		}
 
-		// Update state file
-		state.LastID = highestCompletedID
+		// Update state file with table-specific LastID
+		tableState := state.GetTableState(tableName)
+		if tableState != nil {
+			tableState.LastID = highestCompletedID
+			state.AddOrUpdateTableState(*tableState)
+		}
 		state.LastUpdate = time.Now().Format(time.RFC3339)
 		if err := saveCopyState(stateFile, state); err != nil {
 			// Silently continue on state save error
 		}
 
-		percentage := float64(totalCopied) / float64(estimatedRows) * 100
+		percentage := 0.0
+		if maxID > startID {
+			percentage = float64(highestCompletedID-startID) / float64(maxID-startID) * 100
+		}
 		mu.Unlock()
 
-		msg := fmt.Sprintf("Copied chunk %d-%d (%d rows in %v)", result.startID, result.endID, result.rowCount, result.elapsed)
+		msg := fmt.Sprintf("Copied chunk of %s %d-%d (%d rows in %v)", tableName, result.startID, result.endID, result.rowCount, result.elapsed)
 		if !quiet {
 			fmt.Println(msg)
 		}
-		sendProgress(msg, estimatedRows, totalCopied, highestCompletedID, percentage)
+		sendProgress(msg, maxID, totalCopied, highestCompletedID, percentage)
 	}
 
 	// Check for errors first
@@ -358,22 +533,31 @@ func copyData(ctx context.Context, sourceName, targetName string, sourceDB, targ
 		mu.Lock()
 		totalCopiedFinal := totalCopied
 		lastIDFinal := highestCompletedID
+		percentageFinal := 0.0
+		if maxID > startID {
+			percentageFinal = float64(lastIDFinal-startID) / float64(maxID-startID) * 100
+		}
 		mu.Unlock()
-		sendProgress(fmt.Sprintf("Copy cancelled. Copied %d rows up to ID %d", totalCopiedFinal, lastIDFinal), estimatedRows, totalCopiedFinal, lastIDFinal, float64(totalCopiedFinal)/float64(estimatedRows)*100)
+		sendProgress(fmt.Sprintf("Copy cancelled. Copied %d rows up to ID %d", totalCopiedFinal, lastIDFinal), maxID, totalCopiedFinal, lastIDFinal, percentageFinal)
 		return fmt.Errorf("copy cancelled by user")
 	default:
 	}
 
-	sendProgress("Copy complete!", estimatedRows, totalCopied, highestCompletedID, 100)
+	sendProgress("Copy complete!", maxID, totalCopied, highestCompletedID, 100)
 	if progressChan != nil {
-		progressChan <- CopyProgress{Done: true}
+		// Don't send Done: true here - let the caller (performCopy) handle completion
+		// This allows multiple tables to be copied sequentially without prematurely ending
+		progressChan <- CopyProgress{
+			TableName:  tableName,
+			Message:    fmt.Sprintf("Table %s copied successfully", tableName),
+			TotalRows:  maxID,
+			LastID:     highestCompletedID,
+			Percentage: 100,
+		}
 	}
 
-	// Move state file to completed directory
-	if err := moveStateFileToCompleted(stateFile); err != nil {
-		// Log warning but don't fail the operation
-		fmt.Printf("Warning: failed to move state file to completed: %v\n", err)
-	}
+	// Don't move state file to completed here - it will be moved after all tables complete
+	// This allows multiple tables to share the same state file
 
 	return nil
 }

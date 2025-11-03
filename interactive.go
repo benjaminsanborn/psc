@@ -30,6 +30,12 @@ const (
 	screenDone
 )
 
+type tableConfig struct {
+	whereClause string
+	primaryKey  string
+	lastID      string
+}
+
 type model struct {
 	screen              screen
 	services            map[string]ServiceConfig
@@ -38,9 +44,10 @@ type model struct {
 	target              string
 	table               string
 	tables              []string
-	whereClause         string
-	primaryKey          string
-	lastID              string
+	selectedTables      map[string]bool
+	tableConfigs        map[string]*tableConfig // per-table settings
+	tablesToConfigure   []string                // ordered list of tables to configure
+	currentConfigIndex  int                     // which table we're configuring
 	chunkSize           string
 	chunkSizeEdited     bool
 	parallelism         string
@@ -69,6 +76,17 @@ type model struct {
 	filteredItems       []string
 	confirmDelete       bool
 	deleteIndex         int
+	tableProgress       map[string]tableProgressInfo // Progress per table
+}
+
+// tableProgressInfo holds progress information for a single table
+type tableProgressInfo struct {
+	tableName     string
+	maxID         int64
+	currentLastID int64
+	percentage    float64
+	message       string
+	timeRemaining string
 }
 
 var (
@@ -134,17 +152,18 @@ func runInteractive() error {
 	}
 
 	m := model{
-		screen:       startScreen,
-		services:     services,
-		serviceNames: serviceNames,
-		primaryKey:   "id",
-		lastID:       "0",
-		chunkSize:    "1000",
-		parallelism:  "1",
-		configPath:   configPath,
-		viewportSize: 10, // Show 10 items at a time
-		resumeFiles:  resumeFiles,
-		resumeStates: resumeStates,
+		screen:         startScreen,
+		services:       services,
+		serviceNames:   serviceNames,
+		selectedTables: make(map[string]bool),
+		tableConfigs:   make(map[string]*tableConfig),
+		chunkSize:      "1000",
+		parallelism:    "1",
+		configPath:     configPath,
+		viewportSize:   10, // Show 10 items at a time
+		resumeFiles:    resumeFiles,
+		resumeStates:   resumeStates,
+		tableProgress:  make(map[string]tableProgressInfo),
 	}
 
 	p := tea.NewProgram(m)
@@ -238,6 +257,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case " ":
+			m.confirmCancel = false
+			// Toggle table selection
+			if m.screen == screenTable {
+				var tableName string
+				if len(m.filterText) > 0 {
+					tableName = m.filteredItems[m.cursor]
+				} else {
+					tableName = m.tables[m.cursor]
+				}
+				if m.selectedTables[tableName] {
+					delete(m.selectedTables, tableName)
+				} else {
+					m.selectedTables[tableName] = true
+				}
+				m.err = nil
+				return m, nil
+			}
+
 		case "x":
 			m.confirmCancel = false
 			// Delete state file on resume screen
@@ -297,10 +335,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					state := m.resumeStates[m.cursor]
 					m.source = state.SourceService
 					m.target = state.TargetService
-					m.table = state.TableName
-					m.whereClause = state.WhereClause
-					m.primaryKey = state.PrimaryKey
-					m.lastID = fmt.Sprintf("%d", state.LastID)
+
+					// Handle multiple tables in state
+					selectedTables := make(map[string]bool)
+					m.tablesToConfigure = []string{}
+					m.tableConfigs = make(map[string]*tableConfig)
+
+					for _, tableState := range state.Tables {
+						selectedTables[tableState.TableName] = true
+						m.tablesToConfigure = append(m.tablesToConfigure, tableState.TableName)
+						m.tableConfigs[tableState.TableName] = &tableConfig{
+							whereClause: tableState.WhereClause,
+							primaryKey:  tableState.PrimaryKey,
+							lastID:      fmt.Sprintf("%d", tableState.LastID),
+						}
+					}
+
+					// For backward compatibility: if no tables, try old format
+					if len(state.Tables) == 0 {
+						// This shouldn't happen with migration, but handle gracefully
+						m.screen = screenSource
+						m.cursor = 0
+						m.viewportTop = 0
+						return m, nil
+					}
+
+					m.selectedTables = selectedTables
+					// Set m.table to first table for backward compatibility
+					if len(m.tablesToConfigure) > 0 {
+						m.table = m.tablesToConfigure[0]
+					}
+
 					if state.ChunkSize > 0 {
 						m.chunkSize = fmt.Sprintf("%d", state.ChunkSize)
 					}
@@ -343,6 +408,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.tables = tables
+				m.selectedTables = make(map[string]bool)
 				m.screen = screenTable
 				m.cursor = 0
 				m.viewportTop = 0
@@ -350,11 +416,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filteredItems = nil
 
 			case screenTable:
-				if len(m.filterText) > 0 {
-					m.table = m.filteredItems[m.cursor]
-				} else {
-					m.table = m.tables[m.cursor]
+				// Check if at least one table is selected
+				if len(m.selectedTables) == 0 {
+					m.err = fmt.Errorf("please select at least one table (use spacebar to select)")
+					return m, nil
 				}
+				m.err = nil
+
+				// Set up per-table configuration
+				m.tablesToConfigure = m.getSelectedTablesList()
+				m.currentConfigIndex = 0
+				for _, tableName := range m.tablesToConfigure {
+					if m.tableConfigs[tableName] == nil {
+						m.tableConfigs[tableName] = &tableConfig{
+							primaryKey: "id",
+							lastID:     "0",
+						}
+					}
+				}
+
 				m.screen = screenWhereClause
 				m.cursor = 0
 				m.viewportTop = 0
@@ -366,7 +446,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenLastID
 
 			case screenLastID:
-				m.screen = screenChunkSize
+				// Move to next table's configuration or proceed to chunk size
+				m.currentConfigIndex++
+				if m.currentConfigIndex < len(m.tablesToConfigure) {
+					m.screen = screenWhereClause
+				} else {
+					m.screen = screenChunkSize
+				}
 
 			case screenChunkSize:
 				m.screen = screenParallelism
@@ -382,10 +468,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.totalRows = 0
 				m.progressPct = 0
 				m.progressChan = make(chan CopyProgress, 100)
+				m.tableProgress = make(map[string]tableProgressInfo) // Reset table progress
 				return m, m.performCopy()
 
-			case screenDone:
-				return m, tea.Quit
+				// screenDone is no longer used - we stay on screenCopying after completion
 			}
 
 		case "\\":
@@ -401,7 +487,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.viewportTop = 0
 			case screenWhereClause:
-				m.screen = screenTable
+				// If configuring first table, go back to table selection
+				// Otherwise, go back to previous table's lastID
+				if m.currentConfigIndex == 0 {
+					m.screen = screenTable
+				} else {
+					m.currentConfigIndex--
+					m.screen = screenLastID
+				}
 				m.cursor = 0
 				m.viewportTop = 0
 			case screenPrimaryKey:
@@ -413,6 +506,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.viewportTop = 0
 			case screenChunkSize:
+				// Go back to last table's lastID screen
+				m.currentConfigIndex = len(m.tablesToConfigure) - 1
 				m.screen = screenLastID
 				m.cursor = 0
 				m.viewportTop = 0
@@ -431,18 +526,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "backspace":
 			// Handle backspace in text input fields and filters
 			if m.screen == screenWhereClause {
-				if len(m.whereClause) > 0 {
-					m.whereClause = m.whereClause[:len(m.whereClause)-1]
+				currentTable := m.tablesToConfigure[m.currentConfigIndex]
+				cfg := m.tableConfigs[currentTable]
+				if len(cfg.whereClause) > 0 {
+					cfg.whereClause = cfg.whereClause[:len(cfg.whereClause)-1]
 				}
 			} else if m.screen == screenPrimaryKey {
-				if len(m.primaryKey) > 0 {
-					m.primaryKey = m.primaryKey[:len(m.primaryKey)-1]
+				currentTable := m.tablesToConfigure[m.currentConfigIndex]
+				cfg := m.tableConfigs[currentTable]
+				if len(cfg.primaryKey) > 0 {
+					cfg.primaryKey = cfg.primaryKey[:len(cfg.primaryKey)-1]
 				}
 			} else if m.screen == screenLastID {
-				if len(m.lastID) > 0 {
-					m.lastID = m.lastID[:len(m.lastID)-1]
-					if len(m.lastID) == 0 {
-						m.lastID = "0" // Reset to default
+				currentTable := m.tablesToConfigure[m.currentConfigIndex]
+				cfg := m.tableConfigs[currentTable]
+				if len(cfg.lastID) > 0 {
+					cfg.lastID = cfg.lastID[:len(cfg.lastID)-1]
+					if len(cfg.lastID) == 0 {
+						cfg.lastID = "0" // Reset to default
 					}
 				}
 			} else if m.screen == screenChunkSize {
@@ -477,9 +578,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Handle text input for WHERE clause
 			if m.screen == screenWhereClause {
 				if len(msg.String()) == 1 {
+					currentTable := m.tablesToConfigure[m.currentConfigIndex]
+					cfg := m.tableConfigs[currentTable]
 					// Allow most characters for WHERE clause
 					if msg.String()[0] >= ' ' && msg.String()[0] <= '~' {
-						m.whereClause += msg.String()
+						cfg.whereClause += msg.String()
 					}
 				}
 			}
@@ -489,18 +592,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					msg.String()[0] >= 'A' && msg.String()[0] <= 'Z' ||
 					msg.String()[0] >= '0' && msg.String()[0] <= '9' ||
 					msg.String()[0] == '_') {
-					m.primaryKey += msg.String()
+					currentTable := m.tablesToConfigure[m.currentConfigIndex]
+					cfg := m.tableConfigs[currentTable]
+					cfg.primaryKey += msg.String()
 				}
 			}
 			// Handle numeric input for last-id
 			if m.screen == screenLastID {
 				if len(msg.String()) == 1 && msg.String()[0] >= '0' && msg.String()[0] <= '9' {
+					currentTable := m.tablesToConfigure[m.currentConfigIndex]
+					cfg := m.tableConfigs[currentTable]
 					// Only allow digits
-					if m.lastID == "0" && len(m.lastID) == 1 {
+					if cfg.lastID == "0" && len(cfg.lastID) == 1 {
 						// Replace default "0" with first digit
-						m.lastID = msg.String()
+						cfg.lastID = msg.String()
 					} else {
-						m.lastID += msg.String()
+						cfg.lastID += msg.String()
 					}
 				}
 			}
@@ -554,25 +661,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progressPct = msg.percentage
 		m.timeRemaining = msg.timeRemaining
 		m.estimatedCompletion = msg.completion
+
+		// Update per-table progress
+		if msg.tableName != "" {
+			if _, exists := m.tableProgress[msg.tableName]; !exists {
+				m.tableProgress[msg.tableName] = tableProgressInfo{tableName: msg.tableName}
+			}
+			progress := m.tableProgress[msg.tableName]
+			progress.maxID = msg.totalRows
+			progress.currentLastID = msg.lastID
+			progress.percentage = msg.percentage
+			progress.message = msg.message
+			progress.timeRemaining = msg.timeRemaining
+			m.tableProgress[msg.tableName] = progress
+		}
+
 		// Keep listening for more progress updates
 		return m, waitForProgress(m.progressChan)
 
 	case copyResultMsg:
 		m.result = string(msg)
+		m.progressMsg = string(msg)
 		m.copyInProgress = false
 		m.cancelCopy = nil
-		m.screen = screenDone
+		// Stay on screenCopying to show completion message
 		return m, nil
 
 	case copyErrorMsg:
 		m.err = error(msg)
+		m.progressMsg = fmt.Sprintf("Error: %v", error(msg))
 		m.copyInProgress = false
 		m.cancelCopy = nil
-		m.screen = screenDone
+		// Stay on screenCopying to show error message
 		return m, nil
 	}
 
 	return m, nil
+}
+
+func (m *model) getSelectedTablesList() []string {
+	var selected []string
+	for table := range m.selectedTables {
+		selected = append(selected, table)
+	}
+	sort.Strings(selected)
+	return selected
 }
 
 func (m *model) updateFilter() {
@@ -648,8 +781,22 @@ func (m model) View() string {
 				if state.Parallelism > 1 {
 					parallelInfo = fmt.Sprintf(", workers: %d", state.Parallelism)
 				}
-				label := fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
-					state.SourceService, state.TargetService, state.TableName, state.LastID, chunkInfo, parallelInfo)
+
+				// Display table info
+				var label string
+				if len(state.Tables) == 0 {
+					// Old format - shouldn't happen with migration but handle gracefully
+					label = fmt.Sprintf("📄 %s → %s: (no tables)", state.SourceService, state.TargetService)
+				} else if len(state.Tables) == 1 {
+					// Single table
+					tableState := state.Tables[0]
+					label = fmt.Sprintf("📄 %s → %s: %s (last ID: %d%s%s)",
+						state.SourceService, state.TargetService, tableState.TableName, tableState.LastID, chunkInfo, parallelInfo)
+				} else {
+					// Multiple tables
+					label = fmt.Sprintf("📄 %s → %s: %d tables%s%s",
+						state.SourceService, state.TargetService, len(state.Tables), chunkInfo, parallelInfo)
+				}
 
 				if m.confirmDelete && m.deleteIndex == i {
 					// Show delete confirmation
@@ -770,7 +917,7 @@ func (m model) View() string {
 	case screenTable:
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n\n")
-		s.WriteString(promptStyle.Render("Select table to copy:"))
+		s.WriteString(promptStyle.Render("Select tables to copy (spacebar to toggle, Enter when done):"))
 		s.WriteString("\n")
 
 		displayList := m.tables
@@ -780,6 +927,10 @@ func (m model) View() string {
 			s.WriteString(selectedStyle.Render(m.filterText))
 		} else {
 			s.WriteString(normalStyle.Render(fmt.Sprintf("(%d tables)", len(m.tables))))
+		}
+		selectedCount := len(m.selectedTables)
+		if selectedCount > 0 {
+			s.WriteString(normalStyle.Render(fmt.Sprintf(" • %d selected", selectedCount)))
 		}
 		s.WriteString("\n\n")
 
@@ -802,10 +953,19 @@ func (m model) View() string {
 
 			for i := start; i < end; i++ {
 				name := displayList[i]
+				selected := m.selectedTables[name]
+				checkbox := "☐ "
+				if selected {
+					checkbox = "☑ "
+				}
 				if i == m.cursor {
-					s.WriteString(selectedStyle.Render("▸ " + name))
+					s.WriteString(selectedStyle.Render("▸ " + checkbox + name))
 				} else {
-					s.WriteString(normalStyle.Render("  " + name))
+					if selected {
+						s.WriteString(selectedStyle.Render("  " + checkbox + name))
+					} else {
+						s.WriteString(normalStyle.Render("  " + checkbox + name))
+					}
 				}
 				s.WriteString("\n")
 			}
@@ -824,57 +984,64 @@ func (m model) View() string {
 		}
 
 	case screenWhereClause:
+		currentTable := m.tablesToConfigure[m.currentConfigIndex]
+		cfg := m.tableConfigs[currentTable]
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Configuring table %d of %d: %s", m.currentConfigIndex+1, len(m.tablesToConfigure), currentTable)))
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Enter WHERE clause (optional, leave empty to copy all rows, ex. 'id < 2000'):"))
 		s.WriteString("\n\n")
-		if m.whereClause == "" {
+		if cfg.whereClause == "" {
 			s.WriteString(normalStyle.Render("[No filter - copying all rows]"))
 		} else {
-			s.WriteString(selectedStyle.Render(m.whereClause))
+			s.WriteString(selectedStyle.Render(cfg.whereClause))
 		}
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue"))
 
 	case screenPrimaryKey:
+		currentTable := m.tablesToConfigure[m.currentConfigIndex]
+		cfg := m.tableConfigs[currentTable]
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Configuring table %d of %d: %s", m.currentConfigIndex+1, len(m.tablesToConfigure), currentTable)))
 		s.WriteString("\n")
-		if m.whereClause != "" {
-			s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE: %s", m.whereClause)))
+		if cfg.whereClause != "" {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE: %s", cfg.whereClause)))
 			s.WriteString("\n")
 		}
 		s.WriteString("\n")
 		s.WriteString(promptStyle.Render("Enter primary key column name:"))
 		s.WriteString("\n\n")
-		s.WriteString(selectedStyle.Render(m.primaryKey))
+		s.WriteString(selectedStyle.Render(cfg.primaryKey))
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue"))
 
 	case screenLastID:
+		currentTable := m.tablesToConfigure[m.currentConfigIndex]
+		cfg := m.tableConfigs[currentTable]
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Configuring table %d of %d: %s", m.currentConfigIndex+1, len(m.tablesToConfigure), currentTable)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", cfg.primaryKey)))
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Enter starting ID (for resuming copy):"))
 		s.WriteString("\n\n")
-		s.WriteString(selectedStyle.Render(m.lastID))
+		s.WriteString(selectedStyle.Render(cfg.lastID))
 		s.WriteString("\n\n")
 		s.WriteString(normalStyle.Render("Press Enter to continue (0 = start from beginning)"))
 
 	case screenChunkSize:
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
+		selectedTables := m.getSelectedTablesList()
+		if len(selectedTables) == 1 {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", selectedTables[0])))
+		} else {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Tables: %d selected", len(selectedTables))))
+		}
 		s.WriteString("\n\n")
 		s.WriteString(promptStyle.Render("Enter chunk size (rows per batch):"))
 		s.WriteString("\n\n")
@@ -885,11 +1052,12 @@ func (m model) View() string {
 	case screenParallelism:
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
+		selectedTables := m.getSelectedTablesList()
+		if len(selectedTables) == 1 {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", selectedTables[0])))
+		} else {
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Tables: %d selected", len(selectedTables))))
+		}
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Chunk Size: %s", m.chunkSize)))
 		s.WriteString("\n\n")
@@ -906,101 +1074,193 @@ func (m model) View() string {
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Target:      %s", m.target)))
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table:       %s", m.table)))
-		s.WriteString("\n")
-		if m.whereClause != "" {
-			s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE:       %s", m.whereClause)))
-			s.WriteString("\n")
-		}
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", m.primaryKey)))
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", m.lastID)))
-		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Chunk Size:  %s rows", m.chunkSize)))
 		s.WriteString("\n")
 		s.WriteString(normalStyle.Render(fmt.Sprintf("Parallelism: %s workers", m.parallelism)))
 		s.WriteString("\n\n")
+
+		// Show per-table configurations
+		selectedTables := m.getSelectedTablesList()
+		if len(selectedTables) == 1 {
+			// Show single table details inline
+			table := selectedTables[0]
+			cfg := m.tableConfigs[table]
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Table:       %s", table)))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Primary Key: %s", cfg.primaryKey)))
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Starting ID: %s", cfg.lastID)))
+			s.WriteString("\n")
+			if cfg.whereClause != "" {
+				s.WriteString(normalStyle.Render(fmt.Sprintf("WHERE:       %s", cfg.whereClause)))
+				s.WriteString("\n")
+			}
+		} else {
+			// Show multiple tables with their configs
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Tables:      %d tables", len(selectedTables))))
+			s.WriteString("\n\n")
+			for i, table := range selectedTables {
+				if i >= 5 {
+					s.WriteString(normalStyle.Render(fmt.Sprintf("... and %d more tables", len(selectedTables)-5)))
+					s.WriteString("\n")
+					break
+				}
+				cfg := m.tableConfigs[table]
+				s.WriteString(normalStyle.Render(fmt.Sprintf("  %d. %s", i+1, table)))
+				s.WriteString("\n")
+				s.WriteString(normalStyle.Render(fmt.Sprintf("     pk=%s, start=%s", cfg.primaryKey, cfg.lastID)))
+				if cfg.whereClause != "" {
+					s.WriteString(normalStyle.Render(fmt.Sprintf(", where=%s", cfg.whereClause)))
+				}
+				s.WriteString("\n")
+			}
+		}
+		s.WriteString("\n")
 		s.WriteString(promptStyle.Render("Press Enter to start copy, \\ to go back"))
 
 	case screenCopying:
-		s.WriteString(titleStyle.Render("Copying Data"))
-		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		// Title with progress message on the same line, right-aligned
+		titleText := titleStyle.Render("Copying Data")
+		s.WriteString(titleText)
 		s.WriteString("\n")
-		s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", m.table)))
+		s.WriteString(normalStyle.Render(fmt.Sprintf("Source: %s → Target: %s", m.source, m.target)))
+		s.WriteString("\n\n")
+		s.WriteString(normalStyle.Render(m.progressMsg))
 		s.WriteString("\n\n")
 
-		if m.totalRows > 0 {
-			// Progress bar
-			barWidth := 50
-			filled := int(float64(barWidth) * m.progressPct / 100.0)
-			if filled > barWidth {
-				filled = barWidth
+		selectedTables := m.getSelectedTablesList()
+
+		// Show progress bars for each table
+		if len(selectedTables) > 1 {
+			// Multiple tables - show progress bar for each in table format
+			// Find max table name length and max ID string length for alignment
+			maxNameLen := 0
+			maxIDStrLen := 0
+			for _, tableName := range selectedTables {
+				if len(tableName) > maxNameLen {
+					maxNameLen = len(tableName)
+				}
+				if progress, exists := m.tableProgress[tableName]; exists && progress.maxID > 0 {
+					idStr := fmt.Sprintf("%s/%s", formatNumber(progress.currentLastID), formatNumber(progress.maxID))
+					if len(idStr) > maxIDStrLen {
+						maxIDStrLen = len(idStr)
+					}
+				}
 			}
-			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
-			s.WriteString("\n\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows:  %s", formatNumber(m.totalRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Next ID:         %s", formatNumber(m.currentLastID))))
-			s.WriteString("\n")
-			if m.timeRemaining != "" {
-				s.WriteString(normalStyle.Render(fmt.Sprintf("Time Left:       %s", m.timeRemaining)))
+			if maxNameLen < 8 {
+				maxNameLen = 8 // minimum width
+			}
+
+			barWidth := 40
+
+			// Format each table row with aligned columns
+			for _, tableName := range selectedTables {
+				progress, exists := m.tableProgress[tableName]
+				if !exists {
+					// Table hasn't started yet - show pending
+					namePadded := fmt.Sprintf("%-*s", maxNameLen, tableName)
+					s.WriteString(normalStyle.Render(fmt.Sprintf("⏳ %s  Waiting...", namePadded)))
+					s.WriteString("\n")
+					continue
+				}
+
+				// Progress bar for this table
+				filled := int(float64(barWidth) * progress.percentage / 100.0)
+				if filled > barWidth {
+					filled = barWidth
+				}
+				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+				// Status icon
+				status := "🔄"
+				if progress.percentage >= 100 {
+					status = "✅"
+				}
+
+				// Format as table: Status | Name | Bar | Percentage | IDs | ETA
+				namePadded := fmt.Sprintf("%-*s", maxNameLen, tableName)
+				percentageStr := fmt.Sprintf("%5.1f%%", progress.percentage)
+
+				// Build the row with aligned columns
+				row := fmt.Sprintf("%s %s  [%s]  %s", status, namePadded, bar, percentageStr)
+
+				// Add ID counts if available (left-aligned for consistent column alignment)
+				if progress.maxID > 0 {
+					idStr := fmt.Sprintf("%s/%s", formatNumber(progress.currentLastID), formatNumber(progress.maxID))
+					if maxIDStrLen > 0 {
+						row += fmt.Sprintf("  %-*s", maxIDStrLen, idStr)
+					} else {
+						row += fmt.Sprintf("  %s", idStr)
+					}
+
+					// Add ETA if available
+					if progress.timeRemaining != "" {
+						row += fmt.Sprintf("  ETA: %s", progress.timeRemaining)
+					}
+				}
+
+				s.WriteString(row)
 				s.WriteString("\n")
 			}
+		} else if len(selectedTables) == 1 {
+			// Single table - show detailed progress
+			tableName := selectedTables[0]
+			s.WriteString(normalStyle.Render(fmt.Sprintf("Table: %s", tableName)))
+			s.WriteString("\n\n")
+
+			if m.totalRows > 0 {
+				// Progress bar
+				barWidth := 50
+				filled := int(float64(barWidth) * m.progressPct / 100.0)
+				if filled > barWidth {
+					filled = barWidth
+				}
+				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+				s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
+				s.WriteString("\n\n")
+				s.WriteString(normalStyle.Render(fmt.Sprintf("Max ID:         %s", formatNumber(m.totalRows))))
+				s.WriteString("\n")
+				s.WriteString(normalStyle.Render(fmt.Sprintf("Next ID:         %s", formatNumber(m.currentLastID))))
+				s.WriteString("\n")
+				if m.timeRemaining != "" {
+					s.WriteString(normalStyle.Render(fmt.Sprintf("Time Left:       %s", m.timeRemaining)))
+					s.WriteString("\n")
+				}
+				s.WriteString("\n")
+			}
+
+			// Progress message is now shown in header, don't duplicate here
 			s.WriteString("\n")
 		}
 
-		s.WriteString(promptStyle.Render(m.progressMsg))
-		s.WriteString("\n\n")
-
 		// Show appropriate message based on state
-		if m.cancelling {
+		if !m.copyInProgress {
+			// Copy completed or errored
+			if m.err != nil {
+				s.WriteString("\n")
+				s.WriteString(errorStyle.Render(m.progressMsg))
+			} else {
+				s.WriteString("\n")
+				s.WriteString(successStyle.Render(m.progressMsg))
+			}
+			s.WriteString("\n")
+			s.WriteString(normalStyle.Render("Press esc to quit"))
+		} else if m.cancelling {
 			s.WriteString(errorStyle.Render("⏳ Cancelling... please wait for workers to finish safely"))
 		} else if m.confirmCancel {
 			s.WriteString(errorStyle.Render("⚠️  Press ESC again to confirm cancellation"))
 		} else {
 			s.WriteString(normalStyle.Render("Press ESC to cancel (copy will resume from last checkpoint)"))
 		}
-
-	case screenDone:
-		if m.err != nil {
-			s.WriteString(errorStyle.Render(m.err.Error()))
-		} else {
-			s.WriteString(normalStyle.Render(m.result))
-		}
-
-		// Show final statistics
-		if m.totalRows > 0 {
-			s.WriteString("\n\n")
-			s.WriteString(normalStyle.Render("Final Statistics:"))
-			s.WriteString("\n")
-
-			// Progress bar
-			barWidth := 50
-			filled := int(float64(barWidth) * m.progressPct / 100.0)
-			if filled > barWidth {
-				filled = barWidth
-			}
-			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-			s.WriteString(selectedStyle.Render(fmt.Sprintf("[%s] %.1f%%", bar, m.progressPct)))
-			s.WriteString("\n\n")
-
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Estimated Rows: %s", formatNumber(m.totalRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Copied Rows:    %s", formatNumber(m.copiedRows))))
-			s.WriteString("\n")
-			s.WriteString(normalStyle.Render(fmt.Sprintf("Last Copied ID: %s", formatNumber(m.currentLastID-1))))
-			s.WriteString("\n")
-		}
-
-		s.WriteString("\n")
-		s.WriteString(normalStyle.Render("Press esc to quit"))
 	}
 
-	if m.screen != screenDone && m.screen != screenCopying {
+	if m.screen != screenCopying {
 		s.WriteString("\n\n")
-		s.WriteString(normalStyle.Render("↑/↓: navigate • Enter: select • \\: go back • esc: quit"))
+		if m.screen == screenTable {
+			s.WriteString(normalStyle.Render("↑/↓: navigate • Space: toggle • Enter: continue • \\: go back • esc: quit"))
+		} else {
+			s.WriteString(normalStyle.Render("↑/↓: navigate • Enter: select • \\: go back • esc: quit"))
+		}
 	}
 
 	return s.String()
@@ -1009,6 +1269,7 @@ func (m model) View() string {
 type copyResultMsg string
 type copyErrorMsg error
 type copyProgressMsg struct {
+	tableName     string
 	message       string
 	totalRows     int64
 	copiedRows    int64
@@ -1021,14 +1282,6 @@ type copyProgressMsg struct {
 func (m *model) performCopy() tea.Cmd {
 	sourceConfig := m.services[m.source]
 	targetConfig := m.services[m.target]
-
-	// Parse lastID
-	var lastID int64 = 1
-	if m.lastID != "" {
-		if parsed, err := strconv.ParseInt(m.lastID, 10, 64); err == nil {
-			lastID = parsed
-		}
-	}
 
 	// Parse chunkSize
 	var chunkSize int64 = 1000
@@ -1050,12 +1303,86 @@ func (m *model) performCopy() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelCopy = cancel
 
+	// Get selected tables in sorted order
+	selectedTables := m.getSelectedTablesList()
+
+	// Initialize state file with all tables before starting any copy operations
+	tableInfos := make([]struct {
+		Name        string
+		WhereClause string
+		PrimaryKey  string
+		LastID      int64
+	}, 0, len(selectedTables))
+
+	for _, tableName := range selectedTables {
+		cfg := m.tableConfigs[tableName]
+		var lastID int64 = 0
+		if cfg.lastID != "" {
+			if parsed, err := strconv.ParseInt(cfg.lastID, 10, 64); err == nil {
+				lastID = parsed
+			}
+		}
+		tableInfos = append(tableInfos, struct {
+			Name        string
+			WhereClause string
+			PrimaryKey  string
+			LastID      int64
+		}{
+			Name:        tableName,
+			WhereClause: cfg.whereClause,
+			PrimaryKey:  cfg.primaryKey,
+			LastID:      lastID,
+		})
+	}
+
+	stateFile, err := InitializeMultiTableState(m.source, m.target, tableInfos, chunkSize, parallelism)
+	if err != nil {
+		m.progressChan <- CopyProgress{Error: fmt.Errorf("failed to initialize state file: %w", err)}
+		close(m.progressChan)
+		return waitForProgress(m.progressChan)
+	}
+
 	// Start copy in goroutine
 	go func() {
-		err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, m.table, m.whereClause, m.primaryKey, lastID, chunkSize, parallelism, m.progressChan)
-		if err != nil {
-			m.progressChan <- CopyProgress{Error: err}
+		for i, tableName := range selectedTables {
+			// Get per-table config
+			cfg := m.tableConfigs[tableName]
+
+			// Parse this table's lastID
+			var lastID int64 = 0
+			if cfg.lastID != "" {
+				if parsed, err := strconv.ParseInt(cfg.lastID, 10, 64); err == nil {
+					lastID = parsed
+				}
+			}
+
+			// Send message indicating which table we're copying
+			progressMsg := fmt.Sprintf("Copying table %d of %d: %s", i+1, len(selectedTables), tableName)
+			m.progressChan <- CopyProgress{TableName: tableName, Message: progressMsg}
+
+			err := CopyTableWithProgress(ctx, m.source, m.target, sourceConfig, targetConfig, tableName, cfg.whereClause, cfg.primaryKey, lastID, chunkSize, parallelism, m.progressChan)
+			if err != nil {
+				m.progressChan <- CopyProgress{Error: fmt.Errorf("failed to copy table %s: %w", tableName, err)}
+				close(m.progressChan)
+				return
+			}
+
+			// If cancelled, stop copying remaining tables
+			select {
+			case <-ctx.Done():
+				m.progressChan <- CopyProgress{Error: fmt.Errorf("copy cancelled")}
+				close(m.progressChan)
+				return
+			default:
+			}
 		}
+
+		// All tables copied successfully - move state file to completed
+		if err := moveStateFileToCompleted(stateFile); err != nil {
+			// Log warning but don't fail
+			m.progressChan <- CopyProgress{Message: fmt.Sprintf("Warning: failed to move state file to completed: %v", err)}
+		}
+		m.progressChan <- CopyProgress{Done: true, Message: fmt.Sprintf("Successfully copied %d table(s)", len(selectedTables))}
 		close(m.progressChan)
 	}()
 
@@ -1075,11 +1402,17 @@ func waitForProgress(progressChan chan CopyProgress) tea.Cmd {
 			return copyErrorMsg(progress.Error)
 		}
 
+		// Only treat Done: true as completion (but CopyTableWithProgress no longer sends this)
+		// Instead, completion is handled by the goroutine closing the channel after all tables
 		if progress.Done {
-			return copyResultMsg("Table copied successfully!")
+			if progress.Message != "" {
+				return copyResultMsg(progress.Message)
+			}
+			return copyResultMsg("Tables copied successfully!")
 		}
 
 		return copyProgressMsg{
+			tableName:     progress.TableName,
 			message:       progress.Message,
 			totalRows:     progress.TotalRows,
 			copiedRows:    progress.CopiedRows,
