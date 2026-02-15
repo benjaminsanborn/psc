@@ -1,3 +1,10 @@
+# [2.1.0](https://github.com/benjaminsanborn/psc/compare/v2.0.0...v2.1.0) (2026-02-15)
+
+
+### Features
+
+* add --version flag and brew tap install instructions ([debe513](https://github.com/benjaminsanborn/psc/commit/debe5133f17f627941d71b55f9a5cd14a9f8798f))
+
 # [2.0.0](https://github.com/benjaminsanborn/psc/compare/v1.3.0...v2.0.0) (2026-02-15)
 
 
