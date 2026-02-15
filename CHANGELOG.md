@@ -1,3 +1,10 @@
+## [2.1.1](https://github.com/benjaminsanborn/psc/compare/v2.1.0...v2.1.1) (2026-02-15)
+
+
+### Bug Fixes
+
+* update brew tap to benjaminsanborn/psc ([dd1b64f](https://github.com/benjaminsanborn/psc/commit/dd1b64f5ca5bd139c3391ddb96aa1505f27c8790))
+
 # [2.1.0](https://github.com/benjaminsanborn/psc/compare/v2.0.0...v2.1.0) (2026-02-15)
 
 
