@@ -9,10 +9,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// Version is set by goreleaser via ldflags.
+var version = "dev"
+
 func main() {
 	repo := flag.String("repo", ".", "path to migrations directory")
 	service := flag.String("service", "", "default pg_service.conf service name")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("psc %s\n", version)
+		return
+	}
 
 	args := flag.Args()
 

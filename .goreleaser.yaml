@@ -18,6 +18,8 @@ before:
 builds:
   - env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
     goos:
       - linux
       - windows
@@ -53,7 +55,7 @@ brews:
       email: benjaminsanborn@gmail.com 
     commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
     directory: Formula
-    description: "postgres copy utility"
+    description: "TUI-based daemon for running large-scale PostgreSQL data fix migrations"
     license: "Apache-2.0"
     install: |
       bin.install "psc"
