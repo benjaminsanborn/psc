@@ -3,77 +3,141 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
-	// Check if running without arguments - launch interactive mode
-	if len(os.Args) == 1 {
-		if err := runInteractive(); err != nil {
-			log.Fatalf("Interactive mode failed: %v", err)
-		}
+	repo := flag.String("repo", ".", "path to migrations directory")
+	service := flag.String("service", "", "default pg_service.conf service name")
+	flag.Parse()
+
+	args := flag.Args()
+
+	if len(args) == 0 {
+		// TUI daemon mode
+		runTUI(*repo, *service)
 		return
 	}
 
-	source := flag.String("source", "", "Source service name from pg_service.conf")
-	target := flag.String("target", "", "Target service name from pg_service.conf")
-	table := flag.String("table", "", "Table name to copy")
-	whereClause := flag.String("where", "", "Optional WHERE clause to filter rows (e.g., 'status = active')")
-	primaryKey := flag.String("primary-key", "id", "Primary key column for chunking (defaults to 'id')")
-	lastID := flag.Int64("last-id", 0, "Resume copy from this ID (optional, defaults to 0)")
-	chunkSize := flag.Int64("chunk-size", 1000, "Number of rows per batch (defaults to 1000)")
-	parallelism := flag.Int("parallelism", 1, "Number of concurrent workers (defaults to 1)")
-	targetSetup := flag.String("target-setup", "", "Optional SQL statements to execute on target before copy (semicolon-separated)")
+	switch args[0] {
+	case "status":
+		runStatus(*repo, *service)
+	case "run":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: psc run <name>")
+			os.Exit(1)
+		}
+		runSingle(*repo, *service, args[1])
+	case "cancel":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: psc cancel <name>")
+			os.Exit(1)
+		}
+		runCancel(*repo, *service, args[1])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
+		os.Exit(1)
+	}
+}
 
-	flag.Parse()
+func runTUI(repo, service string) {
+	d, err := NewDaemon(repo, service)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer d.StateDB.Close()
 
-	if *source == "" || *target == "" || *table == "" {
-		fmt.Println("Usage: psc -source <service> -target <service> -table <tablename>")
-		flag.PrintDefaults()
+	p := tea.NewProgram(NewModel(d), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runStatus(repo, service string) {
+	d, err := NewDaemon(repo, service)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer d.StateDB.Close()
+
+	if err := d.Poll(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Determine service file path
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("Failed to get home directory: %v", err)
-	}
-	configPath := fmt.Sprintf("%s/.pg_service.conf", home)
-
-	// Parse service file
-	services, err := ParseServiceFile(configPath)
-	if err != nil {
-		log.Fatalf("Failed to parse service file: %v", err)
+	records := d.Records()
+	if len(records) == 0 {
+		fmt.Println("No migrations found.")
+		return
 	}
 
-	sourceConfig, ok := services[*source]
-	if !ok {
-		log.Fatalf("Source service '%s' not found in %s", *source, configPath)
-	}
-
-	targetConfig, ok := services[*target]
-	if !ok {
-		log.Fatalf("Target service '%s' not found in %s", *target, configPath)
-	}
-
-	// Copy table
-	if *lastID > 0 {
-		if *whereClause != "" {
-			fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d (WHERE: %s, chunk size: %d, workers: %d)...\n", *table, *source, *target, *lastID, *whereClause, *chunkSize, *parallelism)
-		} else {
-			fmt.Printf("Resuming copy of table '%s' from '%s' to '%s' starting at ID %d (chunk size: %d, workers: %d)...\n", *table, *source, *target, *lastID, *chunkSize, *parallelism)
+	fmt.Printf("%-12s %-32s %-18s %s\n", "STATUS", "NAME", "PROGRESS", "AFFECTED")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, r := range records {
+		progress := "—"
+		affected := "—"
+		if r.Status == "completed" {
+			progress = "100%"
 		}
-	} else {
-		if *whereClause != "" {
-			fmt.Printf("Copying table '%s' from '%s' to '%s' (WHERE: %s, chunk size: %d, workers: %d)...\n", *table, *source, *target, *whereClause, *chunkSize, *parallelism)
-		} else {
-			fmt.Printf("Copying table '%s' from '%s' to '%s' (chunk size: %d, workers: %d)...\n", *table, *source, *target, *chunkSize, *parallelism)
+		if r.TotalAffected > 0 {
+			affected = FormatNumber(r.TotalAffected)
 		}
+		fmt.Printf("%-12s %-32s %-18s %s\n", r.Status, r.Name, progress, affected)
 	}
-	if err := CopyTable(*source, *target, sourceConfig, targetConfig, *table, *whereClause, *primaryKey, *lastID, *chunkSize, *parallelism, *targetSetup); err != nil {
-		log.Fatalf("Failed to copy table: %v", err)
+}
+
+func runSingle(repo, service, name string) {
+	d, err := NewDaemon(repo, service)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer d.StateDB.Close()
+
+	if err := d.Poll(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
-	fmt.Println("Table copied successfully!")
+	m := d.GetMigration(name)
+	if m == nil {
+		fmt.Fprintf(os.Stderr, "migration %q not found in repo\n", name)
+		os.Exit(1)
+	}
+
+	record, err := GetMigrationByName(d.StateDB, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Running migration: %s\n", name)
+	if err := d.Executor.Run(m, record); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Done.")
+}
+
+func runCancel(repo, service, name string) {
+	// Cancel only works in TUI/daemon mode since it requires the running context.
+	// For CLI, we just set the status to cancelled in the DB.
+	d, err := NewDaemon(repo, service)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer d.StateDB.Close()
+
+	if err := UpdateStatus(d.StateDB, name, "cancelled"); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Migration %q marked as cancelled.\n", name)
 }

@@ -1,197 +1,136 @@
-# psc
+# psc — datafix migration runner
 
-A fast, parallel table copier for PostgreSQL databases using pg_service.conf
+A TUI-based daemon for running large-scale data fix migrations against PostgreSQL databases.
 
 ## Features
 
-- 🚀 **Fast parallel copying** - Multi-worker support for faster data transfer
-- 📦 **Chunked transfers** - Configurable batch sizes for memory-efficient copying
-- 🔄 **Resume capability** - Automatically tracks progress and resume interrupted copies
-- 🎨 **Interactive TUI** - Beautiful terminal UI for easy operation
-- ⚡ **CLI mode** - Full command-line support for automation
-- 🔍 **Filtered copying** - Optional WHERE clause to copy only specific rows
-- 🔒 **SSL handling** - Automatic SSL fallback if server doesn't support it
-- 📊 **Progress tracking** - Real-time progress with time estimates
+- **Watch mode** — monitors a directory for `.sql` migration files
+- **Batched execution** — split large updates into chunks with configurable parallelism
+- **Resume support** — restart psc and it picks up where it left off
+- **Cancellation** — cancel running migrations gracefully via TUI or CLI
+- **Multi-target** — each migration can target a different `pg_service.conf` service
+- **Live TUI** — real-time progress bars, affected row counts, rate estimates, and ETAs
 
 ## Installation
 
 ```bash
-go install github.com/benjaminsanborn/psc@latest
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/benjaminsanborn/psc
-cd psc
-go build
-```
-
-## Prerequisites
-
-- PostgreSQL `psql` command-line tool installed and in PATH
-- A configured `~/.pg_service.conf` file with your database connections
-
-### Example pg_service.conf
-
-```ini
-[source_db]
-host=source.example.com
-port=5432
-dbname=mydb
-user=postgres
-password=secret
-
-[target_db]
-host=target.example.com
-port=5432
-dbname=mydb
-user=postgres
-password=secret
+go install psc@latest
+# or
+go build -o psc .
 ```
 
 ## Usage
 
-### Interactive Mode (Recommended)
-
-Simply run `psc` without arguments to launch the interactive TUI:
-
 ```bash
-psc
+# Launch TUI daemon (watches for migrations, interactive control)
+psc --repo /path/to/migrations --service my_db
+
+# Show current migration status (non-interactive)
+psc --repo /path/to/migrations --service my_db status
+
+# Run a specific migration immediately (blocking)
+psc --repo /path/to/migrations --service my_db run <name>
+
+# Cancel a running migration
+psc --repo /path/to/migrations --service my_db cancel <name>
 ```
 
-The interactive mode provides:
-- Service selection with filtering
-- Table browsing from source database
-- Resume existing copy operations
-- Progress visualization
-- Cancellation support (ESC to cancel)
+### Flags
 
-### CLI Mode
+| Flag | Description |
+|------|-------------|
+| `--repo` | Path to the migrations directory (default: `.`) |
+| `--service` | Default `pg_service.conf` service name (required) |
 
-```bash
-psc -source <service> -target <service> -table <tablename> [options]
+## Migration Format
+
+Each migration is a `.sql` file with metadata in SQL comments:
+
+```sql
+-- psc:migrate name=convert_paths_to_ltree
+-- psc:target service=my_production_db
+-- psc:batch column=id chunk=10000 parallelism=4
+-- psc:on_error continue
+-- psc:timeout 30s
+
+UPDATE categories
+SET path = text2ltree(path_text)
+WHERE id BETWEEN :start AND :end
+  AND path IS NULL;
 ```
 
-#### Flags
+### Directives
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-source` | Source service name from pg_service.conf | *required* |
-| `-target` | Target service name from pg_service.conf | *required* |
-| `-table` | Table name to copy | *required* |
-| `-where` | Optional WHERE clause to filter rows | *(none)* |
-| `-primary-key` | Primary key column for chunking | `id` |
-| `-last-id` | Resume from this ID (for resuming) | `0` |
-| `-chunk-size` | Rows per batch | `1000` |
-| `-parallelism` | Number of concurrent workers | `1` |
-| `-target-setup` | SQL statements for target (semicolon-separated) | *(none)* |
+| Directive | Required | Description |
+|-----------|----------|-------------|
+| `psc:migrate name=<name>` | ✅ | Unique migration name |
+| `psc:target service=<name>` | No | Target `pg_service.conf` service (overrides `--service`) |
+| `psc:batch column=<col> chunk=<size> parallelism=<n>` | No | Enable batched execution with `:start`/`:end` placeholders |
+| `psc:on_error continue\|abort` | No | Error handling (default: `abort`) |
+| `psc:timeout <duration>` | No | Per-chunk timeout (e.g., `30s`, `5m`) |
 
-#### Examples
+### Non-batched migrations
 
-Basic table copy:
-```bash
-psc -source prod_db -target dev_db -table users
+Without `psc:batch`, the SQL runs as a single statement:
+
+```sql
+-- psc:migrate name=add_default_role
+
+INSERT INTO user_roles (user_id, role)
+SELECT id, 'viewer' FROM users
+WHERE id NOT IN (SELECT user_id FROM user_roles);
 ```
 
-Fast copy with parallel workers:
-```bash
-psc -source prod_db -target dev_db -table users -parallelism 4 -chunk-size 5000
+### Batched migrations
+
+With `psc:batch`, the SQL must contain `:start` and `:end` placeholders:
+
+```sql
+-- psc:migrate name=backfill_emails
+-- psc:batch column=id chunk=5000 parallelism=8
+
+UPDATE users SET email_lower = LOWER(email)
+WHERE id BETWEEN :start AND :end AND email_lower IS NULL;
 ```
 
-Resume an interrupted copy:
-```bash
-psc -source prod_db -target dev_db -table users -last-id 50000
+psc will:
+1. Query `SELECT MAX(id) FROM users` to determine the range
+2. Spawn 8 parallel workers
+3. Each worker processes chunks of 5,000 IDs
+4. Progress is tracked in the `psc_migrations` table for resume support
+
+## TUI Controls
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` or `k`/`j` | Navigate migration list |
+| `r` | Run selected migration |
+| `c` | Cancel selected migration |
+| `d` or `Enter` | View migration details |
+| `b` or `Esc` | Back to list |
+| `q` | Quit |
+
+## Database Setup
+
+psc uses `~/.pg_service.conf` for connection details. Example:
+
+```ini
+[my_db]
+host=localhost
+port=5432
+dbname=myapp
+user=myuser
+password=mypassword
 ```
 
-Copy using a custom primary key:
-```bash
-psc -source prod_db -target dev_db -table orders -primary-key order_id
-```
-
-Copy only specific rows with a WHERE clause:
-```bash
-psc -source prod_db -target dev_db -table users -where "status = 'active' AND created_at > '2024-01-01'"
-```
-
-## How It Works
-
-1. **Connects** to source and target databases using pg_service.conf configurations
-2. **Validates** that the table exists on both source and target
-3. **Chunks** the data based on primary key ranges
-4. **Filters** (optional) - Applies WHERE clause to each chunk if specified
-5. **Copies** data using PostgreSQL's native COPY command via psql
-6. **Tracks** progress in `~/.psc/in_progress/` for resume capability
-7. **Parallelizes** work across multiple workers when configured
-
-The tool uses efficient binary COPY format and pipes data directly between databases for optimal performance.
-
-### WHERE Clause Behavior
-
-When a WHERE clause is provided:
-- It's combined with the chunking logic (applied to each chunk)
-- Useful for copying subsets like active users, recent records, etc.
-- The WHERE clause is wrapped in parentheses and ANDed with the primary key range
-- Example: `WHERE (status = 'active') AND id >= 0 AND id < 1000`
+psc automatically creates a `psc_migrations` table in the target database to track state.
 
 ## State Management
 
-Copy operations are tracked in `~/.psc/`:
-- **In progress**: `~/.psc/in_progress/` - Active copy operations
-- **Completed**: `~/.psc/completed/` - Completed operations with timestamps
+Migration states: `pending` → `running` → `completed` | `failed` | `cancelled`
 
-State files can be:
-- Resumed from interactive mode
-- Manually deleted with 'x' key in TUI
-- Used to restart failed operations
-
-## Running on Remote Servers
-
-### Using tmux for Background Operations
-
-The recommended way to run long copies on remote servers is using `tmux` or `screen`:
-
-```bash
-# 1. SSH to remote server
-ssh user@server
-
-# 2. Start a tmux session
-tmux new -s psc-copy
-
-# 3. Run your copy in interactive mode
-psc
-
-# 4. Close the terminal
-
-# 5. Later, reconnect to check progress
-ssh user@server
-tmux attach -t psc-copy
-
-# 6. When done, exit tmux
-exit  # or Ctrl+D
-```
-
-## Performance Tips
-
-- **Parallelism**: Start with 2-4 workers, test higher values based on your database capacity
-- **Chunk size**: Larger chunks (5000-10000) are faster but use more memory
-- **Network**: Works best on low-latency connections between databases
-- **Indexes**: Consider temporarily dropping indexes on target table for faster inserts
-
-## Requirements
-
-Target table must:
-- Already exist with matching schema
-- Have a numeric primary key (or column specified with `-primary-key`)
-- Be accessible by the target database user
-
-## Limitations
-
-- Only copies table data (not schema, indexes, or constraints)
-- Requires numeric primary key for chunking
-- Both databases must be accessible via psql with service names
-- Parallel mode may cause gaps in ID sequences if chunks fail
-
-## Contributing
-
-Contributions welcome! Please feel free to submit a Pull Request.
+- **pending** — detected but not started (user must press `r`)
+- **running** — currently executing
+- **completed** — finished successfully
+- **failed** — encountered an error (with `on_error=abort`)
+- **cancelled** — stopped by user; can be resumed with `r`
