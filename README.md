@@ -16,8 +16,7 @@ A TUI-based daemon for running large-scale data fix migrations against PostgreSQ
 ### Homebrew
 
 ```bash
-brew tap benjaminsanborn/benjaminsanborn
-brew install psc
+brew install benjaminsanborn/psc/psc
 ```
 
 ### From source
